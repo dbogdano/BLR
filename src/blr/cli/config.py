@@ -1,7 +1,7 @@
 """
 Update configuration file. If no --set option is given the current settings are printed.
 """
-from collections import MutableMapping
+from collections.abc import MutableMapping
 from importlib_resources import path as resource_path
 import logging
 from pathlib import Path
