@@ -227,7 +227,7 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
             if mapper == "ema":
                 # The EMA aligner requires reads in 10x format e.g.
                 # @READNAME:AAAAAAAATATCTACGCTCA BX:Z:AAAAAAAATATCTACGCTCA
-                read1.name = f"{name_and_pos}:{corrected_barcode_seq} {corr_barcode_id}"
+                read1.name = f"{name_and_pos}:{uncorrected_barcode_seq}:{corrected_barcode_seq} {corr_barcode_id}"
                 read2.name = read1.name
             elif mapper != "lariat":
                 _, nr_and_index2 = read2.name.split(maxsplit=1)
