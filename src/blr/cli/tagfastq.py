@@ -67,6 +67,7 @@ def main(args):
         output_nobc2=args.output_nobc2,
         output_bins=args.output_bins,
         nr_bins=args.nr_bins,
+        tmp_dir=args.tmpdir,
         barcode_tag=args.barcode_tag,
         sequence_tag=args.sequence_tag,
         mapper=args.mapper,
@@ -87,6 +88,7 @@ def run_tagfastq(
         output_nobc2: str,
         output_bins: str,
         nr_bins: int,
+        tmp_dir: str, 
         barcode_tag: str,
         sequence_tag: str,
         mapper: str,
@@ -131,7 +133,7 @@ def run_tagfastq(
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
-            chunks = stack.enter_context(ChunkHandler(chunk_size=1_000_000))
+            chunks = stack.enter_context(ChunkHandler(tmpdir= , chunk_size=1_000_000))
 
         for read1, read2, corrected_barcode_seq in parse_reads(reader, seq_to_barcode, uncorrected_barcode_reader,
                                                                barcode_tag, sequence_tag, mapper):
@@ -495,13 +497,13 @@ class Output:
 
 
 class ChunkHandler:
-    def __init__(self, chunk_size: int = 100_000):
+    def __init__(self, tmpdir, chunk_size: int = 100_000):
         # Required for ema sorted output
         # Inspired by: https://stackoverflow.com/questions/56948292/python-sort-a-large-list-that-doesnt-fit-in-memory
         self._output_chunk = []
         self._chunk_size = chunk_size
         self._chunk_id = 0
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="tagfastq_sort", dir=os.getenv('TMPDIR')))
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="tagfastq_sort", dir=tmpdir))
         self._chunk_file_template = "chunk_*.tsv"
         self._chunk_files = []
         self._chunk_sep = "\t"
@@ -599,6 +601,10 @@ def add_arguments(parser):
     parser.add_argument(
         "--nr-bins", type=int, default=100,
         help="Number of bins to split reads into when using the '--output-bins' alternative. Default: %(default)s."
+    )
+    parser.add_argument(
+        "--tmpdir", type=str, default="./",
+        help="tmpdir"
     )
     parser.add_argument(
         "-b", "--barcode-tag", default="BX",
