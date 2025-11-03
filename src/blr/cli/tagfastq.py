@@ -67,7 +67,7 @@ def main(args):
         output_nobc2=args.output_nobc2,
         output_bins=args.output_bins,
         nr_bins=args.nr_bins,
-        tmp_dir=args.tmpdir,
+        tmpdir=args.tmpdir,
         barcode_tag=args.barcode_tag,
         sequence_tag=args.sequence_tag,
         mapper=args.mapper,
@@ -88,7 +88,7 @@ def run_tagfastq(
         output_nobc2: str,
         output_bins: str,
         nr_bins: int,
-        tmp_dir: str, 
+        tmpdir: str, 
         barcode_tag: str,
         sequence_tag: str,
         mapper: str,
@@ -133,7 +133,7 @@ def run_tagfastq(
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
-            chunks = stack.enter_context(ChunkHandler(tmpdir= , chunk_size=1_000_000))
+            chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir , chunk_size=1_000_000))
 
         for read1, read2, corrected_barcode_seq in parse_reads(reader, seq_to_barcode, uncorrected_barcode_reader,
                                                                barcode_tag, sequence_tag, mapper):
