@@ -24,6 +24,7 @@ from heapq import merge
 from itertools import islice, cycle
 import logging
 from pathlib import Path
+import os
 import sys
 import tempfile
 
@@ -500,7 +501,7 @@ class ChunkHandler:
         self._output_chunk = []
         self._chunk_size = chunk_size
         self._chunk_id = 0
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="tagfastq_sort"))
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="tagfastq_sort", dir=os.getenv('TMPDIR')))
         self._chunk_file_template = "chunk_*.tsv"
         self._chunk_files = []
         self._chunk_sep = "\t"
