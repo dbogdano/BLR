@@ -208,6 +208,13 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, seq_to_barcode, heap
             uncorrected_barcode_seq = uncorrected_barcode_reader.get_barcode(name_and_pos)
             corrected_barcode_seq = seq_to_barcode.get(uncorrected_barcode_seq, None)
 
+            raw_barcode_id = f"{sequence_tag}:Z:{uncorrected_barcode_seq}"
+            corr_barcode_id = f"{barcode_tag}:Z:{corrected_barcode_seq}"
+
+            read1.name = f"{name_and_pos}_{raw_barcode_id}_{corr_barcode_id}"
+            read2.name = read1.name
+
+
             # If mapper is ema and output_bins requested, write into deterministic per-bin files
             if mapper == "ema" and output_bins is not None and corrected_barcode_seq is not None:
                 # Compute deterministic bin for this barcode
@@ -231,12 +238,13 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, seq_to_barcode, heap
                     output_handler.write_nobc(read1, read2)
                 continue
 
-            # For non-EMA mappers, update headers similarly to original behavior and write
-            raw_barcode_id = f"{sequence_tag}:Z:{uncorrected_barcode_seq}"
-            corr_barcode_id = f"{barcode_tag}:Z:{corrected_barcode_seq}"
-            # Update read headers
-            read1.name = f"{name_and_pos}_{raw_barcode_id}_{corr_barcode_id}"
-            read2.name = read1.name
+            # # For non-EMA mappers, update headers similarly to original behavior and write
+            # raw_barcode_id = f"{sequence_tag}:Z:{uncorrected_barcode_seq}"
+            # corr_barcode_id = f"{barcode_tag}:Z:{corrected_barcode_seq}"
+            # # Update read headers
+            # read1.name = f"{name_and_pos}_{raw_barcode_id}_{corr_barcode_id}"
+            # read2.name = read1.name
+            
             if output_handler is not None:
                 output_handler.write(read1, read2)
                 summary["Read pairs written"] += 1
@@ -516,7 +524,6 @@ class ChunkHandler:
 
     def _get_heap(self, x):
         return int(x.split(self._chunk_sep)[0])
-
 
 def add_arguments(parser):
     parser.add_argument(
