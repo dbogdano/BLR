@@ -194,12 +194,13 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, seq_to_barcode, heap
         tmpdir_path = Path(tmpdir)
         tmpdir_path.mkdir(parents=True, exist_ok=True)
 
-        # Skip to start_idx
+        # Create an iterator from the reader and skip to start_idx
+        it = iter(reader)
         for _ in range(start_idx):
-            next(reader)
+            next(it, None)
 
-        # Process assigned chunk
-        for read_idx, (read1, read2) in enumerate(reader, start_idx):
+        # Process assigned chunk using the iterator
+        for read_idx, (read1, read2) in enumerate(it, start_idx):
             if read_idx >= end_idx:
                 break
 
