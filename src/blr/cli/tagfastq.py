@@ -33,6 +33,7 @@ import pandas as pd
 from xopen import xopen
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
+from blr.cli.tagfastq_mpi import build_barcode_lmdb
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ def main(args):
         min_count=args.min_count,
         pattern_match=args.pattern_match,
         sample_number=args.sample_nr,
+        build_db=args.build_db if hasattr(args, 'build_db') else False,
+        lmdb_map_size=getattr(args, 'lmdb_map_size', None),
     )
 
 
@@ -95,9 +98,23 @@ def run_tagfastq(
         min_count: int,
         pattern_match: str,
         sample_number: int,
+        build_db: bool = False,
+        lmdb_map_size: int = None,
 ):
     logger.info("Starting")
     summary = Summary()
+    # Optionally only build LMDB DB and exit
+    if build_db:
+        logger.info("Building LMDB barcode DB (build_db requested)")
+        template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
+        db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+        map_size = lmdb_map_size if lmdb_map_size is not None else (1 << 34)
+        build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count, chunksize=10000, map_size=map_size)
+        logger.info(f"Barcode DB written to {db_path}")
+        summary.print_stats(__name__)
+        logger.info("Finished building DB")
+        return
+
     # Get the corrected barcodes and create a dictionary pointing each raw barcode to its
     # canonical sequence.
     logger.info("Map clusters")
@@ -631,4 +648,15 @@ def add_arguments(parser):
     parser.add_argument(
         "--sample-nr", type=int, default=1,
         help="Sample number to append to barcode string. Default: %(default)s."
+    )
+    parser.add_argument(
+        "--build-db",
+        action="store_true",
+        help="Only build the barcode LMDB in --tmpdir and exit."
+    )
+    parser.add_argument(
+        "--lmdb-map-size",
+        type=int,
+        default=None,
+        help="Optional LMDB map size in bytes to use when building the LMDB (default: 1<<34)."
     )

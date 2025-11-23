@@ -24,6 +24,7 @@ import hashlib
 # Reuse helper classes/functions from serial tagfastq implementation
 from blr.cli.tagfastq import BarcodeReader, map_corrected_barcodes, Output, scramble, match_template
 import sqlite3
+import lmdb
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
 
@@ -139,6 +140,87 @@ def build_barcode_sqlite(clusters_file: str, db_path: str, summary, mapper, temp
     return db_path, heap_index
 
 
+def build_barcode_lmdb(clusters_file: str, lmdb_path: str, summary, mapper, template=None, min_count=0,
+                       chunksize: int = 10000, map_size: int = 1 << 34):
+    """Build an LMDB key-value store mapping raw barcode -> canonical barcode.
+
+    lmdb_path: path to LMDB directory (LMDB uses a directory on disk).
+    map_size: maximum size in bytes for the LMDB map. Default ~16GiB. Increase if needed.
+    """
+    lmdb_dir = Path(lmdb_path)
+    if lmdb_dir.exists():
+        # If existing, remove or raise; we'll remove to ensure fresh db
+        for child in lmdb_dir.iterdir():
+            child.unlink()
+        lmdb_dir.rmdir()
+    lmdb_dir.mkdir(parents=True, exist_ok=True)
+
+    env = lmdb.open(str(lmdb_dir), map_size=map_size)
+    txn = env.begin(write=True)
+
+    total_clusters = 0
+    total_reads = 0
+    kept_clusters = 0
+    kept_reads = 0
+    canonical_seqs = []
+
+    cols = ["canonical_seq", "size", "cluster_seqs"]
+    for chunk in pd.read_csv(clusters_file, sep="\t", names=cols, dtype={"canonical_seq": str, "size": int, "cluster_seqs": str}, chunksize=chunksize):
+        total_clusters += len(chunk)
+        total_reads += chunk["size"].sum()
+
+        if template:
+            mask = (chunk["size"] >= min_count) & (chunk["canonical_seq"].apply(match_template, template=template))
+        else:
+            mask = (chunk["size"] >= min_count)
+
+        filtered = chunk[mask]
+        kept_clusters += len(filtered)
+        kept_reads += filtered["size"].sum()
+
+        for canonical, seqs in zip(filtered["canonical_seq"], filtered["cluster_seqs"]):
+            canonical_seqs.append(canonical)
+            if not isinstance(seqs, str):
+                continue
+            for raw in seqs.split(","):
+                # LMDB keys/values must be bytes
+                txn.put(raw.encode("ascii"), canonical.encode("ascii"))
+
+        # commit periodically
+        txn.commit()
+        txn = env.begin(write=True)
+
+    summary["Corrected barcodes"] = total_clusters
+    summary["Reads with corrected barcodes"] = int(total_reads)
+    summary["Barcodes not passing filters"] = total_clusters - kept_clusters
+    summary["Reads with barcodes not passing filters"] = int(total_reads - kept_reads)
+
+    heap_index = {}
+    if mapper in ["ema", "lariat"]:
+        canonical_list = canonical_seqs
+        if mapper == "ema":
+            scramble(canonical_list, maxiter=100)
+        heap_index = {seq: nr for nr, seq in enumerate(canonical_list)}
+
+    # final commit and close
+    txn.commit()
+    env.sync()
+    env.close()
+
+    return str(lmdb_dir), heap_index
+
+
+def open_barcode_lmdb_readonly(lmdb_path: str):
+    env = lmdb.open(str(lmdb_path), readonly=True, lock=False, max_readers=256)
+    txn = env.begin(buffers=False)
+    return env, txn
+
+
+def lookup_lmdb(txn, raw_seq: str):
+    val = txn.get(raw_seq.encode("ascii"))
+    return val.decode("ascii") if val is not None else None
+
+
 def open_barcode_db_readonly(db_path: str):
     """Open sqlite barcode DB in read-only mode and return connection and cursor."""
     uri = f'file:{db_path}?mode=ro'
@@ -175,6 +257,8 @@ def main(args):
         min_count=args.min_count,
         pattern_match=args.pattern_match,
         sample_number=args.sample_nr,
+        build_db=args.build_db if hasattr(args, 'build_db') else False,
+        lmdb_map_size=getattr(args, 'lmdb_map_size', None),
     )
 
 def run_tagfastq_mpi(
@@ -195,16 +279,34 @@ def run_tagfastq_mpi(
         min_count: int,
         pattern_match: str,
         sample_number: int,
+        build_db: bool = False,
+        lmdb_map_size: Optional[int] = None,
 ):
     summary = Summary()
     
-    # Only rank 0 builds the barcode SQLite DB and broadcasts the DB path and heap
+    # Optionally, only build DB and exit: build on rank 0 then barrier and return
+    if build_db:
+        if rank == 0:
+            logger.info("Building LMDB barcode DB (build_db requested)")
+            template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
+            db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+            map_size = lmdb_map_size if lmdb_map_size is not None else (1 << 34)
+            build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count, chunksize=10000, map_size=map_size)
+            logger.info(f"Barcode DB written to {db_path}")
+        # synchronize and exit
+        comm.Barrier()
+        if rank == 0:
+            summary.print_stats(__name__)
+            logger.info("Finished building DB")
+        return
+
+    # Only rank 0 builds the barcode LMDB and broadcasts the DB path and heap
     if rank == 0:
-        logger.info("Map clusters and build barcode DB")
+        logger.info("Map clusters and build barcode DB (LMDB)")
         template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-        db_path = str(Path(tmpdir) / "barcode_mapping.sqlite")
-        # build_barcode_sqlite returns (db_path, heap_index)
-        db_path, heap = build_barcode_sqlite(corrected_barcodes, db_path, summary, mapper, template, min_count)
+        db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+        # build_barcode_lmdb returns (db_path, heap_index)
+        db_path, heap = build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count)
     else:
         db_path = None
         heap = None
@@ -280,8 +382,13 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
         # If a barcode DB path was provided, open it read-only for lookups
         conn = None
         cur = None
+        lmdb_env = None
+        lmdb_txn = None
         if barcode_db_path is not None:
-            conn, cur = open_barcode_db_readonly(barcode_db_path)
+            if barcode_db_path.endswith('.lmdb'):
+                lmdb_env, lmdb_txn = open_barcode_lmdb_readonly(barcode_db_path)
+            else:
+                conn, cur = open_barcode_db_readonly(barcode_db_path)
 
         # Process assigned chunk using the iterator
         for read_idx, (read1, read2) in enumerate(it, start_idx):
@@ -290,7 +397,9 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
 
             name_and_pos = read1.name.split(maxsplit=1)[0]
             uncorrected_barcode_seq = uncorrected_barcode_reader.get_barcode(name_and_pos)
-            if cur is not None:
+            if lmdb_txn is not None:
+                corrected_barcode_seq = lookup_lmdb(lmdb_txn, uncorrected_barcode_seq)
+            elif cur is not None:
                 corrected_barcode_seq = lookup_canonical(cur, uncorrected_barcode_seq)
             else:
                 corrected_barcode_seq = None
@@ -348,6 +457,8 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
         # Close DB connection if opened
         if conn is not None:
             conn.close()
+        if lmdb_env is not None:
+            lmdb_env.close()
 
 def merge_rank_outputs(tmpdir, final_output, num_ranks, nr_bins=None):
     """Merge temporary outputs from all ranks into final output files.
@@ -701,4 +812,15 @@ def add_arguments(parser):
         type=int,
         default=1000000,
         help="Number of reads to process in each MPI chunk. Default: %(default)s"
+    )
+    parser.add_argument(
+        "--build-db",
+        action="store_true",
+        help="Only build the barcode LMDB in --tmpdir and exit (rank 0 does the build)."
+    )
+    parser.add_argument(
+        "--lmdb-map-size",
+        type=int,
+        default=None,
+        help="Optional LMDB map size in bytes to use when building the LMDB (default: 1<<34)."
     )

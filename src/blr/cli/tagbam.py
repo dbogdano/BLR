@@ -5,6 +5,8 @@ Strips headers from tags and depending on mode, set the appropriate SAM tag.
 import logging
 from itertools import chain
 import re
+import sqlite3
+import lmdb
 
 from blr.utils import Summary, PySAMIO, get_bamtag, tqdm
 
@@ -19,7 +21,45 @@ def main(args):
         output=args.output,
         sample_number=args.sample_nr,
         barcode_tag=args.barcode_tag,
+        barcode_db=args.barcode_db if hasattr(args, 'barcode_db') else None,
     )
+
+
+# Globals for optional barcode DB
+_barcode_db_conn = None
+_barcode_db_cur = None
+_barcode_db_type = None
+
+
+def open_sqlite_readonly(db_path: str):
+    uri = f'file:{db_path}?mode=ro'
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    cur = conn.cursor()
+    return conn, cur
+
+
+def open_lmdb_readonly(lmdb_path: str):
+    env = lmdb.open(str(lmdb_path), readonly=True, lock=False, max_readers=256)
+    txn = env.begin(buffers=False)
+    return env, txn
+
+
+def open_barcode_db_readonly(db_path: str):
+    if db_path.endswith('.lmdb'):
+        return open_lmdb_readonly(db_path)
+    else:
+        return open_sqlite_readonly(db_path)
+
+
+def lookup_canonical(cur, raw_seq: str):
+    cur.execute("SELECT canonical_seq FROM mapping WHERE raw_seq = ?;", (raw_seq,))
+    r = cur.fetchone()
+    return r[0] if r else None
+
+
+def lookup_lmdb(txn, raw_seq: str):
+    val = txn.get(raw_seq.encode('ascii'))
+    return val.decode('ascii') if val is not None else None
 
 
 def get_mode(parser, barcode_tag: str):
@@ -56,21 +96,39 @@ def run_tagbam(
         output: str,
         sample_number: int,
         barcode_tag: str,
+    barcode_db: str = None,
 ):
     logger.info("Starting analysis")
 
     summary = Summary()
 
-    # Read SAM/BAM files and transfer barcode information from alignment name to SAM tag
-    with PySAMIO(input, output, __name__) as (infile, outfile):
-        parser = infile.fetch(until_eof=True)
-        processing_function, parser = get_mode(parser, barcode_tag=barcode_tag)
+    # Optionally open barcode DB for canonical lookups (memory-saving)
+    global _barcode_db_conn, _barcode_db_cur, _barcode_db_type
+    if barcode_db:
+        _barcode_db_conn, _barcode_db_cur = open_barcode_db_readonly(barcode_db)
+        # set type for later lookups/closing
+        _barcode_db_type = 'lmdb' if str(barcode_db).endswith('.lmdb') else 'sqlite'
 
-        for read in tqdm(parser, desc="Processing reads", unit=" reads"):
-            # Strips header from tag and depending on script mode, possibly sets SAM tag
-            summary["Total reads"] += 1
-            processing_function(read, sample_number, barcode_tag, summary)
-            outfile.write(read)
+    try:
+        # Read SAM/BAM files and transfer barcode information from alignment name to SAM tag
+        with PySAMIO(input, output, __name__) as (infile, outfile):
+            parser = infile.fetch(until_eof=True)
+            processing_function, parser = get_mode(parser, barcode_tag=barcode_tag)
+
+            for read in tqdm(parser, desc="Processing reads", unit=" reads"):
+                # Strips header from tag and depending on script mode, possibly sets SAM tag
+                summary["Total reads"] += 1
+                processing_function(read, sample_number, barcode_tag, summary)
+                outfile.write(read)
+    finally:
+        if _barcode_db_conn is not None:
+            try:
+                _barcode_db_conn.close()
+            except Exception:
+                pass
+            _barcode_db_conn = None
+            _barcode_db_cur = None
+            _barcode_db_type = None
 
     summary.print_stats(name=__name__)
     logger.info("Finished")
@@ -122,7 +180,19 @@ def mode_ema(read, sample_nr, barcode_tag, _):  # summary is passed to this func
         # Ema also trims the barcode to 16bp (10x Barcode length) so it need to be exchanged for the one in the header.
         # Make sure that the SAM tag barcode is a substring of the header barcode
         assert header_barcode.startswith(tag_barcode)
-        read.set_tag(barcode_tag, f"{header_barcode}-{sample_nr}", value_type="Z")
+
+        # If a barcode DB cursor/env is available, try to lookup canonical sequence
+        global _barcode_db_conn, _barcode_db_cur, _barcode_db_type
+        canonical = None
+        if _barcode_db_type == 'lmdb' and _barcode_db_cur is not None:
+            canonical = lookup_lmdb(_barcode_db_cur, header_barcode)
+        elif _barcode_db_type == 'sqlite' and _barcode_db_cur is not None:
+            canonical = lookup_canonical(_barcode_db_cur, header_barcode)
+
+        if canonical:
+            read.set_tag(barcode_tag, f"{canonical}-{sample_nr}", value_type="Z")
+        else:
+            read.set_tag(barcode_tag, f"{header_barcode}-{sample_nr}", value_type="Z")
 
 
 def mode_void(*args, **kwargs):
@@ -150,4 +220,8 @@ def add_arguments(parser):
     parser.add_argument(
         "-b", "--barcode-tag", default="BX",
         help="SAM tag for storing the error corrected barcode. Default: %(default)s."
+    )
+    parser.add_argument(
+        "--barcode-db", default=None,
+        help="Path to a barcode DB for canonical mapping. Supports SQLite (.sqlite) or LMDB (.lmdb)."
     )
