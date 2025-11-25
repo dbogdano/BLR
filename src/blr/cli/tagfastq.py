@@ -44,7 +44,9 @@ IUPAC = {
     "T": "T",
     "R": "AG",
     "Y": "CT",
-    "M": "AC",
+    "M": "AC",    PYTHONPATH=/path/to/BLR/src python3 -m blr tagfastq \
+      uncorrected.fastq corrected_clusters.clstr reads_R1.fastq reads_R2.fastq \
+      --barcode-db /path/tmp/barcode_mapping.lmdb --chunk-size 50000 --tmpdir /path/tmp
     "K": "GT",
     "S": "CG",
     "W": "AT",
@@ -111,7 +113,9 @@ def run_tagfastq(
     if build_db:
         logger.info("Building LMDB barcode DB (build_db requested)")
         template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-        db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+        # When building DB explicitly prefer the current working directory
+        # rather than a scratch tmpdir so the DB remains local to the project.
+        db_path = str(Path.cwd() / "barcode_mapping.lmdb")
         map_size = lmdb_map_size if lmdb_map_size is not None else (1 << 34)
         build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count, chunksize=10000, map_size=map_size)
         logger.info(f"Barcode DB written to {db_path}")

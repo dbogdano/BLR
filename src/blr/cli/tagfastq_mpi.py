@@ -138,7 +138,9 @@ def run_tagfastq_mpi(
         if rank == 0:
             logger.info("Building LMDB barcode DB (build_db requested)")
             template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-            db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+            # When building DB explicitly prefer the current working directory
+            # rather than a scratch tmpdir so the DB remains local to the project.
+            db_path = str(Path.cwd() / "barcode_mapping.lmdb")
             map_size = lmdb_map_size if lmdb_map_size is not None else (1 << 34)
             build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count, chunksize=10000, map_size=map_size)
             logger.info(f"Barcode DB written to {db_path}")
@@ -153,7 +155,7 @@ def run_tagfastq_mpi(
     if rank == 0:
         logger.info("Map clusters and build barcode DB (LMDB)")
         template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-        db_path = str(Path(tmpdir) / "barcode_mapping.lmdb")
+        db_path = str(Path.cwd() / "barcode_mapping.lmdb")
         # build_barcode_lmdb returns (db_path, heap_index)
         db_path, heap = build_barcode_lmdb(corrected_barcodes, db_path, summary, mapper, template, min_count)
     else:
