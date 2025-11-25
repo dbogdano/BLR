@@ -33,7 +33,7 @@ import pandas as pd
 from xopen import xopen
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
-from blr.cli._barcode_db import build_barcode_lmdb
+from blr.cli._barcode_db import build_barcode_lmdb, open_sqlite_readonly, open_lmdb_readonly, lookup_lmdb, lookup_canonical
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,8 @@ def main(args):
         sample_number=args.sample_nr,
         build_db=args.build_db if hasattr(args, 'build_db') else False,
         lmdb_map_size=getattr(args, 'lmdb_map_size', None),
+        barcode_db=getattr(args, 'barcode_db', None),
+        chunk_size=getattr(args, 'chunk_size', None),
     )
 
 
@@ -100,6 +102,8 @@ def run_tagfastq(
         sample_number: int,
         build_db: bool = False,
         lmdb_map_size: int = None,
+        barcode_db: str = None,
+        chunk_size: int = 100_000,
 ):
     logger.info("Starting")
     summary = Summary()
@@ -116,10 +120,22 @@ def run_tagfastq(
         return
 
     # Get the corrected barcodes and create a dictionary pointing each raw barcode to its
-    # canonical sequence.
+    # canonical sequence. If a barcode DB is provided we avoid building the full
+    # raw->canonical dict (which can be very large) and only build the heap index
+    # needed for ema/lariat sorting when required.
     logger.info("Map clusters")
     template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-    seq_to_barcode, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count)
+    if barcode_db:
+        # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
+        if mapper in ["ema", "lariat"]:
+            # Build only the heap index for sorting
+            seq_to_barcode = None
+            _, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count, only_heap=True)
+        else:
+            seq_to_barcode = None
+            heap = {}
+    else:
+        seq_to_barcode, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count)
 
     in_interleaved = not input2
     logger.info(f"Input detected as {'interleaved' if in_interleaved else 'paired'} FASTQ.")
@@ -142,6 +158,20 @@ def run_tagfastq(
         output_nobc1, output_nobc2 = None, None
 
     # Parse input FASTA/FASTQ for read1 and read2, uncorrected barcodes and write output
+    # Optionally open barcode DB for runtime lookups (memory saving)
+    db_conn = None
+    db_cur = None
+    db_env = None
+    db_txn = None
+    db_type = None
+    if barcode_db:
+        if str(barcode_db).endswith('.lmdb'):
+            db_env, db_txn = open_lmdb_readonly(barcode_db)
+            db_type = 'lmdb'
+        else:
+            db_conn, db_cur = open_sqlite_readonly(barcode_db)
+            db_type = 'sqlite'
+
     with ExitStack() as stack:
         reader = stack.enter_context(dnaio.open(input1, file2=input2, interleaved=in_interleaved, mode="r"))
         writer = stack.enter_context(Output(file1=output1, file2=output2, interleaved=out_interleaved,
@@ -150,10 +180,11 @@ def run_tagfastq(
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
-            chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir , chunk_size=1_000_000))
+            chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir , chunk_size=chunk_size))
 
-        for read1, read2, corrected_barcode_seq in parse_reads(reader, seq_to_barcode, uncorrected_barcode_reader,
-                                                               barcode_tag, sequence_tag, mapper):
+        for read1, read2, corrected_barcode_seq in parse_reads(
+            reader, seq_to_barcode, uncorrected_barcode_reader, barcode_tag, sequence_tag,
+            mapper, db_type=db_type, db_cur=db_cur, db_txn=db_txn):
             summary["Read pairs read"] += 1
             if corrected_barcode_seq is None:
                 summary["Reads missing barcode"] += 1
@@ -210,7 +241,19 @@ def run_tagfastq(
         elif mapper == "lariat":
             write_lariat_output(chunks, writer, summary)
 
-    summary.print_stats(__name__)
+        # Close any DB resources opened for lookup
+        try:
+            if db_conn is not None:
+                db_conn.close()
+        except Exception:
+            pass
+        try:
+            if db_env is not None:
+                db_env.close()
+        except Exception:
+            pass
+
+        summary.print_stats(__name__)
 
     logger.info("Finished")
 
@@ -230,14 +273,20 @@ def write_lariat_output(chunks, writer, summary):
         summary["Read pairs written"] += 1
 
 
-def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_tag, sequence_tag, mapper):
+def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_tag, sequence_tag, mapper,
+                db_type: str = None, db_cur=None, db_txn=None):
     for read1, read2 in tqdm(reader, desc="Read pairs processed"):
         # Header parsing
         # TODO Handle reads with single header
         name_and_pos, nr_and_index1 = read1.name.split(maxsplit=1)
 
         uncorrected_barcode_seq = uncorrected_barcode_reader.get_barcode(name_and_pos)
-        corrected_barcode_seq = corrected_barcodes.get(uncorrected_barcode_seq, None)
+        if db_type == 'lmdb' and db_txn is not None:
+            corrected_barcode_seq = lookup_lmdb(db_txn, uncorrected_barcode_seq)
+        elif db_type == 'sqlite' and db_cur is not None:
+            corrected_barcode_seq = lookup_canonical(db_cur, uncorrected_barcode_seq)
+        else:
+            corrected_barcode_seq = corrected_barcodes.get(uncorrected_barcode_seq, None) if corrected_barcodes is not None else None
 
         # Check if barcode was found and update header with barcode info.
         if corrected_barcode_seq is not None:
@@ -258,7 +307,7 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         yield read1, read2, corrected_barcode_seq
 
 
-def map_corrected_barcodes(file, summary, mapper, template, min_count=0):
+def map_corrected_barcodes(file, summary, mapper, template, min_count=0, only_heap: bool = False):
     """
     Parse starcode cluster output and return a dictionary with raw sequences pointing to a
     corrected canonical sequence
@@ -280,6 +329,17 @@ def map_corrected_barcodes(file, summary, mapper, template, min_count=0):
 
     summary["Barcodes not passing filters"] = summary["Corrected barcodes"] - len(df)
     summary["Reads with barcodes not passing filters"] = summary["Reads with corrected barcodes"] - sum(df["size"])
+
+    if only_heap:
+        # Only build canonical list -> heap index to minimize memory usage
+        canonical_seqs = df["canonical_seq"].tolist()
+        heap_index = {}
+        if mapper in ["ema", "lariat"]:
+            logger.info("Creating heap index for sorting barcodes for ema mapping.")
+            if mapper == "ema":
+                scramble(canonical_seqs, maxiter=100)
+            heap_index = {seq: nr for nr, seq in enumerate(canonical_seqs)}
+        return {}, heap_index
 
     corrected_barcodes = {
         s: canonical for canonical, seqs in zip(df["canonical_seq"], df["cluster_seqs"]) for s in seqs.split(",")
@@ -659,4 +719,12 @@ def add_arguments(parser):
         type=int,
         default=None,
         help="Optional LMDB map size in bytes to use when building the LMDB (default: 1<<34)."
+    )
+    parser.add_argument(
+        "--barcode-db", default=None,
+        help="Path to a barcode DB for canonical mapping. Supports SQLite (.sqlite) or LMDB (.lmdb)."
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=100_000,
+        help="Chunk size for temporary chunk files (lower reduces peak memory). Default: %(default)s"
     )
