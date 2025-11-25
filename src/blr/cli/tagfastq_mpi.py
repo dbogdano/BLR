@@ -23,7 +23,7 @@ import hashlib
 
 # Reuse helper classes/functions from serial tagfastq implementation
 from blr.cli.tagfastq import BarcodeReader, map_corrected_barcodes, Output
-from blr.cli.barcode_db import build_barcode_lmdb, build_barcode_sqlite, open_sqlite_readonly, open_lmdb_readonly, lookup_canonical, lookup_lmdb
+from blr.cli._barcode_db import build_barcode_lmdb, build_barcode_sqlite, open_sqlite_readonly, open_lmdb_readonly, lookup_canonical, lookup_lmdb
 import sqlite3
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS

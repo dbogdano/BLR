@@ -27,10 +27,26 @@ def main(commandline_arguments=None) -> int:
     # It needs to implement an add_arguments() and a main() function.
     modules = pkgutil.iter_modules(cli_package.__path__)
     for _, module_name, _ in modules:
-        module = importlib.import_module("." + module_name, cli_package.__name__)
+        # Skip private/helper modules (underscore-prefixed) or known helpers
+        # to avoid importing heavy dependencies that are not CLI subcommands.
+        if module_name.startswith("_") or module_name == "barcode_db":
+            logger.debug("Skipping helper module: %s", module_name)
+            continue
+        try:
+            module = importlib.import_module("." + module_name, cli_package.__name__)
+        except Exception as e:
+            logger.debug("Skipping module '%s' due to import error: %s", module_name, e)
+            continue
+
         # Some modules may not define a module-level docstring; guard against None
         module_doc = module.__doc__ or ""
         help = module_doc.strip().split("\n", maxsplit=1)[0] if module_doc.strip() else ""
+
+        # Only register modules that implement the CLI contract (add_arguments and main)
+        if not (hasattr(module, "add_arguments") and hasattr(module, "main")):
+            logger.debug("Skipping non-command module: %s", module_name)
+            continue
+
         subparser = subparsers.add_parser(module_name, help=help, description=module_doc,
                                           formatter_class=RawDescriptionHelpFormatter)
         subparser.set_defaults(module=module)
