@@ -113,8 +113,10 @@ def build_barcode_lmdb(clusters_file: str, lmdb_path: str, summary, mapper, temp
     canonical_seqs = []
 
     cols = ["canonical_seq", "size", "cluster_seqs"]
-    # Use a write transaction per chunk
-    with env.begin(write=True) as txn:
+    # Use a write transaction per chunk. Manage transactions manually to avoid
+    # mixing context-manager-managed transactions with manual begin/commit.
+    txn = env.begin(write=True)
+    try:
         for chunk in pd.read_csv(clusters_file, sep="\t", names=cols, dtype={"canonical_seq": str, "size": int, "cluster_seqs": str}, chunksize=chunksize):
             total_clusters += len(chunk)
             total_reads += chunk["size"].sum()
@@ -135,8 +137,19 @@ def build_barcode_lmdb(clusters_file: str, lmdb_path: str, summary, mapper, temp
                 for raw in seqs.split(","):
                     txn.put(raw.encode("ascii"), canonical.encode("ascii"))
 
+            # commit and start a new write txn for the next chunk
             txn.commit()
             txn = env.begin(write=True)
+    finally:
+        try:
+            # ensure the last transaction is committed
+            if txn:
+                try:
+                    txn.commit()
+                except Exception:
+                    pass
+        finally:
+            txn = None
 
     summary["Corrected barcodes"] = total_clusters
     summary["Reads with corrected barcodes"] = int(total_reads)
