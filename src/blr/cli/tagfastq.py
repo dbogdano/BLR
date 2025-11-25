@@ -33,7 +33,7 @@ import pandas as pd
 from xopen import xopen
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
-from blr.cli.tagfastq_mpi import build_barcode_lmdb
+from blr.cli.barcode_db import build_barcode_lmdb
 
 logger = logging.getLogger(__name__)
 

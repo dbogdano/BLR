@@ -22,9 +22,9 @@ from mpi4py import MPI
 import hashlib
 
 # Reuse helper classes/functions from serial tagfastq implementation
-from blr.cli.tagfastq import BarcodeReader, map_corrected_barcodes, Output, scramble, match_template
+from blr.cli.tagfastq import BarcodeReader, map_corrected_barcodes, Output
+from blr.cli.barcode_db import build_barcode_lmdb, build_barcode_sqlite, open_sqlite_readonly, open_lmdb_readonly, lookup_canonical, lookup_lmdb
 import sqlite3
-import lmdb
 
 from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
 
@@ -79,160 +79,9 @@ def barcode_to_bin(barcode: str, nr_bins: int) -> int:
     return val % nr_bins
 
 
-def build_barcode_sqlite(clusters_file: str, db_path: str, summary, mapper, template=None, min_count=0,
-                         chunksize: int = 10000):
-    """Build a SQLite DB mapping raw barcode -> canonical barcode from starcode clusters file.
-
-    Returns a heap_index dict if mapper requires it (ema/lariat), otherwise returns empty dict.
-    """
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
-    cur.execute("CREATE TABLE IF NOT EXISTS mapping(raw_seq TEXT PRIMARY KEY, canonical_seq TEXT);")
-    insert_sql = "INSERT OR REPLACE INTO mapping(raw_seq, canonical_seq) VALUES (?, ?);"
-
-    total_clusters = 0
-    total_reads = 0
-    kept_clusters = 0
-    kept_reads = 0
-    canonical_seqs = []
-
-    cols = ["canonical_seq", "size", "cluster_seqs"]
-    for chunk in pd.read_csv(clusters_file, sep="\t", names=cols, dtype={"canonical_seq": str, "size": int, "cluster_seqs": str}, chunksize=chunksize):
-        total_clusters += len(chunk)
-        total_reads += chunk["size"].sum()
-
-        if template:
-            mask = (chunk["size"] >= min_count) & (chunk["canonical_seq"].apply(match_template, template=template))
-        else:
-            mask = (chunk["size"] >= min_count)
-
-        filtered = chunk[mask]
-        kept_clusters += len(filtered)
-        kept_reads += filtered["size"].sum()
-
-        rows_to_insert = []
-        for canonical, seqs in zip(filtered["canonical_seq"], filtered["cluster_seqs"]):
-            canonical_seqs.append(canonical)
-            if not isinstance(seqs, str):
-                continue
-            for raw in seqs.split(","):
-                rows_to_insert.append((raw, canonical))
-
-        if rows_to_insert:
-            cur.executemany(insert_sql, rows_to_insert)
-            conn.commit()
-
-    summary["Corrected barcodes"] = total_clusters
-    summary["Reads with corrected barcodes"] = int(total_reads)
-    summary["Barcodes not passing filters"] = total_clusters - kept_clusters
-    summary["Reads with barcodes not passing filters"] = int(total_reads - kept_reads)
-
-    heap_index = {}
-    if mapper in ["ema", "lariat"]:
-        canonical_list = canonical_seqs
-        if mapper == "ema":
-            scramble(canonical_list, maxiter=100)
-        heap_index = {seq: nr for nr, seq in enumerate(canonical_list)}
-
-    conn.close()
-    return db_path, heap_index
-
-
-def build_barcode_lmdb(clusters_file: str, lmdb_path: str, summary, mapper, template=None, min_count=0,
-                       chunksize: int = 10000, map_size: int = 1 << 34):
-    """Build an LMDB key-value store mapping raw barcode -> canonical barcode.
-
-    lmdb_path: path to LMDB directory (LMDB uses a directory on disk).
-    map_size: maximum size in bytes for the LMDB map. Default ~16GiB. Increase if needed.
-    """
-    lmdb_dir = Path(lmdb_path)
-    if lmdb_dir.exists():
-        # If existing, remove or raise; we'll remove to ensure fresh db
-        for child in lmdb_dir.iterdir():
-            child.unlink()
-        lmdb_dir.rmdir()
-    lmdb_dir.mkdir(parents=True, exist_ok=True)
-
-    env = lmdb.open(str(lmdb_dir), map_size=map_size)
-    txn = env.begin(write=True)
-
-    total_clusters = 0
-    total_reads = 0
-    kept_clusters = 0
-    kept_reads = 0
-    canonical_seqs = []
-
-    cols = ["canonical_seq", "size", "cluster_seqs"]
-    for chunk in pd.read_csv(clusters_file, sep="\t", names=cols, dtype={"canonical_seq": str, "size": int, "cluster_seqs": str}, chunksize=chunksize):
-        total_clusters += len(chunk)
-        total_reads += chunk["size"].sum()
-
-        if template:
-            mask = (chunk["size"] >= min_count) & (chunk["canonical_seq"].apply(match_template, template=template))
-        else:
-            mask = (chunk["size"] >= min_count)
-
-        filtered = chunk[mask]
-        kept_clusters += len(filtered)
-        kept_reads += filtered["size"].sum()
-
-        for canonical, seqs in zip(filtered["canonical_seq"], filtered["cluster_seqs"]):
-            canonical_seqs.append(canonical)
-            if not isinstance(seqs, str):
-                continue
-            for raw in seqs.split(","):
-                # LMDB keys/values must be bytes
-                txn.put(raw.encode("ascii"), canonical.encode("ascii"))
-
-        # commit periodically
-        txn.commit()
-        txn = env.begin(write=True)
-
-    summary["Corrected barcodes"] = total_clusters
-    summary["Reads with corrected barcodes"] = int(total_reads)
-    summary["Barcodes not passing filters"] = total_clusters - kept_clusters
-    summary["Reads with barcodes not passing filters"] = int(total_reads - kept_reads)
-
-    heap_index = {}
-    if mapper in ["ema", "lariat"]:
-        canonical_list = canonical_seqs
-        if mapper == "ema":
-            scramble(canonical_list, maxiter=100)
-        heap_index = {seq: nr for nr, seq in enumerate(canonical_list)}
-
-    # final commit and close
-    txn.commit()
-    env.sync()
-    env.close()
-
-    return str(lmdb_dir), heap_index
-
-
-def open_barcode_lmdb_readonly(lmdb_path: str):
-    env = lmdb.open(str(lmdb_path), readonly=True, lock=False, max_readers=256)
-    txn = env.begin(buffers=False)
-    return env, txn
-
-
-def lookup_lmdb(txn, raw_seq: str):
-    val = txn.get(raw_seq.encode("ascii"))
-    return val.decode("ascii") if val is not None else None
-
-
-def open_barcode_db_readonly(db_path: str):
-    """Open sqlite barcode DB in read-only mode and return connection and cursor."""
-    uri = f'file:{db_path}?mode=ro'
-    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-    cur = conn.cursor()
-    return conn, cur
-
-
-def lookup_canonical(cur, raw_seq: str):
-    cur.execute("SELECT canonical_seq FROM mapping WHERE raw_seq = ?;", (raw_seq,))
-    r = cur.fetchone()
-    return r[0] if r else None
+# Barcode DB helper functions (LMDB/SQLite builders and readers) live in
+# `blr.cli.barcode_db` and are imported at the top of this file. This avoids
+# circular imports and centralizes disk-backed barcode lookup logic.
 
 def main(args):
     # Only rank 0 prints the start message
@@ -386,9 +235,9 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
         lmdb_txn = None
         if barcode_db_path is not None:
             if barcode_db_path.endswith('.lmdb'):
-                lmdb_env, lmdb_txn = open_barcode_lmdb_readonly(barcode_db_path)
+                lmdb_env, lmdb_txn = open_lmdb_readonly(barcode_db_path)
             else:
-                conn, cur = open_barcode_db_readonly(barcode_db_path)
+                conn, cur = open_sqlite_readonly(barcode_db_path)
 
         # Process assigned chunk using the iterator
         for read_idx, (read1, read2) in enumerate(it, start_idx):
