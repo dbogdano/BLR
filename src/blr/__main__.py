@@ -28,8 +28,10 @@ def main(commandline_arguments=None) -> int:
     modules = pkgutil.iter_modules(cli_package.__path__)
     for _, module_name, _ in modules:
         module = importlib.import_module("." + module_name, cli_package.__name__)
-        help = module.__doc__.strip().split("\n", maxsplit=1)[0]
-        subparser = subparsers.add_parser(module_name, help=help, description=module.__doc__,
+        # Some modules may not define a module-level docstring; guard against None
+        module_doc = module.__doc__ or ""
+        help = module_doc.strip().split("\n", maxsplit=1)[0] if module_doc.strip() else ""
+        subparser = subparsers.add_parser(module_name, help=help, description=module_doc,
                                           formatter_class=RawDescriptionHelpFormatter)
         subparser.set_defaults(module=module)
         module.add_arguments(subparser)
