@@ -639,10 +639,10 @@ def add_arguments(parser):
              "clustering with '--print-clusters' enabled."
     )
     parser.add_argument(
-        "input1",
+        "input1", nargs='?',
         help="Input FASTQ/FASTA file. Assumes to contain read1 if given with second input file. "
              "If only input1 is given, input is assumed to be an interleaved. If reading from stdin"
-             "is requested use '-' as a placeholder."
+             " is requested use '-' as a placeholder. When using --build-db this argument may be omitted."
     )
     parser.add_argument(
         "input2", nargs='?',
