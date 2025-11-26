@@ -108,6 +108,7 @@ def main(args):
         sample_number=args.sample_nr,
         build_db=args.build_db if hasattr(args, 'build_db') else False,
         lmdb_map_size=getattr(args, 'lmdb_map_size', None),
+        bin_map=getattr(args, 'bin_map', None),
     )
 
 def run_tagfastq_mpi(
@@ -130,6 +131,7 @@ def run_tagfastq_mpi(
         sample_number: int,
         build_db: bool = False,
         lmdb_map_size: Optional[int] = None,
+        bin_map: str = None,
 ):
     summary = Summary()
     
@@ -191,7 +193,8 @@ def run_tagfastq_mpi(
     process_reads_chunk(
         input1, input2, start_idx, end_idx, db_path, heap,
         output_handler, barcode_tag, sequence_tag, mapper, summary,
-        uncorrected_barcodes=uncorrected_barcodes, output_bins=output_bins, nr_bins=nr_bins, tmpdir=tmpdir, rank=rank
+        uncorrected_barcodes=uncorrected_barcodes, output_bins=output_bins, nr_bins=nr_bins, tmpdir=tmpdir, rank=rank,
+        bin_map=bin_map
     )
     
     # Synchronize all processes
@@ -210,7 +213,8 @@ def run_tagfastq_mpi(
 
 def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, heap,
                        output_handler, barcode_tag, sequence_tag, mapper, summary,
-                       uncorrected_barcodes=None, output_bins=None, nr_bins=None, tmpdir=".", rank=0):
+                       uncorrected_barcodes=None, output_bins=None, nr_bins=None, tmpdir=".", rank=0,
+                       bin_map: str = None):
     """Process a chunk of reads assigned to this rank.
 
     For EMA + output_bins we deterministically partition reads by corrected barcode using
@@ -222,6 +226,21 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
 
         # Prepare per-bin writers (lazy-open)
         bin_writers = {}
+        # If a deterministic bin mapping TSV is provided, load it (canonical_seq -> bin_index)
+        bin_mapping = None
+        if bin_map is not None:
+            import csv as _csv
+            bin_mapping = {}
+            try:
+                with open(bin_map, newline="") as _fh:
+                    rdr = _csv.DictReader(_fh, delimiter="\t")
+                    for row in rdr:
+                        try:
+                            bin_mapping[row['canonical_seq']] = int(row['bin_index'])
+                        except Exception:
+                            continue
+            except Exception:
+                bin_mapping = None
         tmpdir_path = Path(tmpdir)
         tmpdir_path.mkdir(parents=True, exist_ok=True)
 
@@ -264,8 +283,13 @@ def process_reads_chunk(input1, input2, start_idx, end_idx, barcode_db_path, hea
 
             # If mapper is ema and output_bins requested, write into deterministic per-bin files
             if mapper == "ema" and output_bins is not None and corrected_barcode_seq is not None:
-                # Compute deterministic bin for this barcode
-                bin_idx = barcode_to_bin(corrected_barcode_seq, nr_bins)
+                # Determine bin: prefer provided bin_mapping, otherwise deterministic MD5
+                if bin_mapping is not None:
+                    bin_idx = bin_mapping.get(corrected_barcode_seq, None)
+                    if bin_idx is None:
+                        bin_idx = barcode_to_bin(corrected_barcode_seq, nr_bins)
+                else:
+                    bin_idx = barcode_to_bin(corrected_barcode_seq, nr_bins)
                 # Lazy open writer for this bin
                 if bin_idx not in bin_writers:
                     bin_file = tmpdir_path / f"bin_{str(bin_idx).zfill(3)}_rank_{rank}.fastq"
@@ -674,4 +698,8 @@ def add_arguments(parser):
         type=int,
         default=None,
         help="Optional LMDB map size in bytes to use when building the LMDB (default: 1<<34)."
+    )
+    parser.add_argument(
+        "--bin-map", default=None,
+        help="Optional TSV file (canonical_seq, bin_index) produced by deterministic_tagfastq to write reads directly into bins."
     )

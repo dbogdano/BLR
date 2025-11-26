@@ -81,6 +81,7 @@ def main(args):
         lmdb_map_size=getattr(args, 'lmdb_map_size', None),
         barcode_db=getattr(args, 'barcode_db', None),
         chunk_size=getattr(args, 'chunk_size', None),
+        bin_map=getattr(args, 'bin_map', None),
     )
 
 
@@ -106,6 +107,7 @@ def run_tagfastq(
         lmdb_map_size: int = None,
         barcode_db: str = None,
         chunk_size: int = 100_000,
+        bin_map: str = None,
 ):
     logger.info("Starting")
     summary = Summary()
@@ -178,9 +180,22 @@ def run_tagfastq(
 
     with ExitStack() as stack:
         reader = stack.enter_context(dnaio.open(input1, file2=input2, interleaved=in_interleaved, mode="r"))
+        # Load bin mapping if requested
+        bin_mapping = None
+        if bin_map is not None:
+            import csv as _csv
+            bin_mapping = {}
+            with open(bin_map, newline="") as _fh:
+                reader_map = _csv.DictReader(_fh, delimiter="\t")
+                for row in reader_map:
+                    try:
+                        bin_mapping[row['canonical_seq']] = int(row['bin_index'])
+                    except Exception:
+                        continue
+
         writer = stack.enter_context(Output(file1=output1, file2=output2, interleaved=out_interleaved,
                                             file_nobc1=output_nobc1, file_nobc2=output_nobc2, mapper=mapper,
-                                            bins_dir=output_bins))
+                                            bins_dir=output_bins, nr_bins=nr_bins, bin_map=bin_mapping))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
@@ -205,14 +220,19 @@ def run_tagfastq(
 
             # Write to out
             if mapper == "ema":
-                chunks.build_chunk(
-                    f"{str(heap[corrected_barcode_seq])}\t"
-                    f"{read1.name}\t"
-                    f"{read1.sequence}\t"
-                    f"{read1.qualities}\t"
-                    f"{read2.sequence}\t"
-                    f"{read2.qualities}\n"
-                )
+                # If a deterministic bin mapping is provided, write directly into per-bin FASTQ files
+                if bin_mapping is not None and corrected_barcode_seq is not None:
+                    writer.write_to_bin(read1, read2, corrected_barcode_seq)
+                    summary["Read pairs written"] += 1
+                else:
+                    chunks.build_chunk(
+                        f"{str(heap[corrected_barcode_seq])}\t"
+                        f"{read1.name}\t"
+                        f"{read1.sequence}\t"
+                        f"{read1.qualities}\t"
+                        f"{read2.sequence}\t"
+                        f"{read2.qualities}\n"
+                    )
             elif mapper == "lariat":
                 corrected_barcode_qual = "K" * len(corrected_barcode_seq)
                 chunks.build_chunk(
@@ -435,7 +455,7 @@ class Output:
     BIN_FASTQ_TEMPLATE = "ema-bin-*"  # Same name as in `ema preproc`.
 
     def __init__(self, file1=None, file2=None, interleaved=False, file_nobc1=None, file_nobc2=None, mapper=None,
-                 bins_dir=None, nr_bins=None):
+                 bins_dir=None, nr_bins=None, bin_map=None):
         self._mapper = mapper
 
         self._bin_nr = 0
@@ -444,6 +464,7 @@ class Output:
         self._bins_dir = bins_dir
         self._nr_bins = nr_bins
         self._barcode_bin_map = {}
+        self._barcode_to_bin = bin_map
         self._open_bins = None
         self._prev_heap = None
         self._bin_filled = True
@@ -471,6 +492,16 @@ class Output:
         else:
             self._write = self._write_default
             self._write_nobc = self._write_nobc_default
+
+        # If a deterministic bin mapping is provided, pre-open all bin files.
+        if self._barcode_to_bin is not None:
+            # Ensure bins_dir is provided
+            if self._bins_dir is None:
+                raise ValueError("--bin-map provided but no --output-bins directory set")
+            # Determine nr_bins if not already set
+            if self._nr_bins is None:
+                self._nr_bins = max(self._barcode_to_bin.values()) + 1 if self._barcode_to_bin else 0
+            self._open_all_bins()
 
     def set_bin_size(self, value):
         self._bin_size = value
@@ -517,6 +548,16 @@ class Output:
 
         self._open_file = next(self._open_bins)
 
+    def _open_all_bins(self):
+        # Open all bins into a list indexed by bin index for direct mapping writes
+        self._bin_files = []
+        # Reset _bin_nr so filenames correspond to indices
+        self._bin_nr = 0
+        for i in range(self._nr_bins):
+            bin_nr_str = str(i).zfill(3)
+            file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
+            self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
+
     def _check_bin_full(self):
         if self._reads_written > self._bin_size:
             self._bin_filled = True
@@ -531,6 +572,22 @@ class Output:
     def _write_ema_special(self, read1, read2, barcode):
         line = f"{barcode} @{read1.name} {read1.sequence} {read1.qualities} {read2.sequence} {read2.qualities}\n"
         self._open_file.write(line)
+
+    def write_to_bin(self, read1, read2, canonical_barcode):
+        """Write a read pair directly to the bin assigned for canonical_barcode."""
+        if self._barcode_to_bin is None:
+            raise RuntimeError("No bin mapping provided for direct bin writes")
+        try:
+            bin_idx = self._barcode_to_bin[canonical_barcode]
+        except KeyError:
+            # If barcode not in mapping, fallback to opening next bin in round robin
+            if not hasattr(self, '_bin_files'):
+                self._open_all_bins()
+            # choose bin by hashing canonical
+            bin_idx = hash(canonical_barcode) % len(self._bin_files)
+
+        fh = self._bin_files[bin_idx]
+        fh.write(read1, read2)
 
     def write(self, read1, read2=None, heap=None):
         self._pre_write(heap)
@@ -731,4 +788,8 @@ def add_arguments(parser):
     parser.add_argument(
         "--chunk-size", type=int, default=100_000,
         help="Chunk size for temporary chunk files (lower reduces peak memory). Default: %(default)s"
+    )
+    parser.add_argument(
+        "--bin-map", default=None,
+        help="Optional TSV file (canonical_seq, bin_index) produced by deterministic_tagfastq to write reads directly into bins."
     )
