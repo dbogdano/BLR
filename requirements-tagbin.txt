@@ -1,0 +1,5 @@
+pandas
+dnaio
+xopen
+lmdb
+mpi4py
