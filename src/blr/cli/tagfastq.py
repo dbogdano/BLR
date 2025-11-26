@@ -44,9 +44,7 @@ IUPAC = {
     "T": "T",
     "R": "AG",
     "Y": "CT",
-    "M": "AC",    PYTHONPATH=/path/to/BLR/src python3 -m blr tagfastq \
-      uncorrected.fastq corrected_clusters.clstr reads_R1.fastq reads_R2.fastq \
-      --barcode-db /path/tmp/barcode_mapping.lmdb --chunk-size 50000 --tmpdir /path/tmp
+    "M": "AC",
     "K": "GT",
     "S": "CG",
     "W": "AT",
@@ -54,7 +52,7 @@ IUPAC = {
     "B": "CGT",
     "V": "ACG",
     "D": "AGT",
-    "N": "ACGT"
+    "N": "ACGT",
 }
 
 
