@@ -38,7 +38,6 @@ dependencies:
   - dnaio
   - whatshap
   - mosdepth>=0.2.9
-  - parallel 
-  - mpi4py
+  - parallel
   - py-lmdb
   - pip
