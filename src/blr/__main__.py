@@ -29,7 +29,7 @@ def main(commandline_arguments=None) -> int:
     for _, module_name, _ in modules:
         # Skip private/helper modules (underscore-prefixed) or known helpers
         # to avoid importing heavy dependencies that are not CLI subcommands.
-        if module_name.startswith("_") or module_name == "barcode_db":
+        if module_name.startswith("_") or module_name in ("barcode_db", "tagfastq_mpi"):
             logger.debug("Skipping helper module: %s", module_name)
             continue
         try:
