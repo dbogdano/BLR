@@ -1,7 +1,16 @@
 from pathlib import Path
-import pandas as pd
 import sqlite3
-import lmdb
+
+# Optional heavy dependencies - import lazily so CLI discovery doesn't require them.
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    import lmdb
+except Exception:
+    lmdb = None
 
 # Local replacements of helper functions to avoid circular imports
 
@@ -34,6 +43,8 @@ def scramble(seqs, maxiter=10):
 
 def build_barcode_sqlite(clusters_file: str, db_path: str, summary, mapper, template=None, min_count=0,
                          chunksize: int = 10000):
+    if pd is None:
+        raise RuntimeError("pandas is required to build the barcode sqlite DB; install pandas in the runtime environment")
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("PRAGMA journal_mode=WAL;")
@@ -91,6 +102,10 @@ def build_barcode_sqlite(clusters_file: str, db_path: str, summary, mapper, temp
 
 def build_barcode_lmdb(clusters_file: str, lmdb_path: str, summary, mapper, template=None, min_count=0,
                        chunksize: int = 10000, map_size: int = 1 << 34):
+    if pd is None:
+        raise RuntimeError("pandas is required to build the barcode lmdb DB; install pandas in the runtime environment")
+    if lmdb is None:
+        raise RuntimeError("py-lmdb is required to build or open LMDB barcode DB; install py-lmdb in the runtime environment")
     lmdb_dir = Path(lmdb_path)
     if lmdb_dir.exists():
         for child in lmdb_dir.iterdir():

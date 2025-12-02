@@ -28,11 +28,28 @@ import os
 import sys
 import tempfile
 
-import dnaio
-import pandas as pd
-from xopen import xopen
+# Heavy third-party I/O libraries are optional at import-time. Guard imports so
+# the CLI can be discovered even if these packages are not installed in the
+# current environment. Actual functions that need these packages will raise a
+# clear error at runtime if they are missing.
+try:
+    import dnaio
+except Exception:
+    dnaio = None
 
-from blr.utils import tqdm, Summary, ACCEPTED_READ_MAPPERS
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+try:
+    from xopen import xopen
+except Exception:
+    xopen = None
+
+# Defer importing heavy project utilities until runtime so CLI discovery
+# succeeds even when optional runtime dependencies (pysam, etc.) are missing.
+
 from blr.cli._barcode_db import build_barcode_lmdb, open_sqlite_readonly, open_lmdb_readonly, lookup_lmdb, lookup_canonical
 
 logger = logging.getLogger(__name__)
@@ -108,6 +125,15 @@ def run_tagfastq(
         bin_map: str = None,
 ):
     logger.info("Starting")
+    # Lazy import Summary to avoid import-time dependency on heavy libs (pysam, etc.).
+    try:
+        from blr.utils import Summary
+    except Exception as e:
+        raise RuntimeError(
+            "Missing runtime dependency from 'blr.utils' (e.g. pysam). "
+            "Run this command in the BLR conda environment or install required packages."
+        ) from e
+
     summary = Summary()
     # Optionally only build LMDB DB and exit
     if build_db:
@@ -177,6 +203,9 @@ def run_tagfastq(
             db_type = 'sqlite'
 
     with ExitStack() as stack:
+        # Ensure I/O libraries are available at runtime when actually executing
+        if dnaio is None or xopen is None:
+            raise RuntimeError("Required I/O libraries (dnaio/xopen) are not installed in this environment.")
         reader = stack.enter_context(dnaio.open(input1, file2=input2, interleaved=in_interleaved, mode="r"))
         # Load bin mapping if requested
         bin_mapping = None
@@ -297,6 +326,14 @@ def write_lariat_output(chunks, writer, summary):
 
 def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_tag, sequence_tag, mapper,
                 db_type: str = None, db_cur=None, db_txn=None):
+    # Lazy import tqdm so module import does not require blr.utils dependencies.
+    try:
+        from blr.utils import tqdm
+    except Exception:
+        # fallback to identity iterator
+        def tqdm(x, **_):
+            return x
+
     for read1, read2 in tqdm(reader, desc="Read pairs processed"):
         # Header parsing
         # TODO Handle reads with single header
@@ -750,11 +787,24 @@ def add_arguments(parser):
         "-s", "--sequence-tag", default="RX",
         help="SAM tag for storing the uncorrected barcode sequence. Default: %(default)s."
     )
-    parser.add_argument(
-        "-m", "--mapper", default="bowtie2", choices=ACCEPTED_READ_MAPPERS,
-        help="Specify read mapper for labeling reads with barcodes. Selecting 'ema' or 'lariat' produces output "
-             "required for these particular mappers. Default: %(default)s."
-    )
+    # Try to import accepted mappers from blr.utils; if unavailable (missing deps),
+    # fall back to no 'choices' constraint so CLI discovery still works.
+    try:
+        from blr.utils import ACCEPTED_READ_MAPPERS
+    except Exception:
+        ACCEPTED_READ_MAPPERS = None
+
+    if ACCEPTED_READ_MAPPERS:
+        parser.add_argument(
+            "-m", "--mapper", default="bowtie2", choices=ACCEPTED_READ_MAPPERS,
+            help="Specify read mapper for labeling reads with barcodes. Selecting 'ema' or 'lariat' produces output "
+                 "required for these particular mappers. Default: %(default)s."
+        )
+    else:
+        parser.add_argument(
+            "-m", "--mapper", default="bowtie2",
+            help="Specify read mapper for labeling reads with barcodes. Default: %(default)s."
+        )
     parser.add_argument(
         "-c", "--min-count", default=0, type=int,
         help="Minimum number of reads per barcode to tag read name. Default: %(default)s."
