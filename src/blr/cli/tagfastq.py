@@ -97,6 +97,7 @@ def main(args):
         barcode_db=getattr(args, 'barcode_db', None),
         chunk_size=getattr(args, 'chunk_size', None),
         bin_map=getattr(args, 'bin_map', None),
+        sort_within_bin=getattr(args, 'sort_within_bin', False),
     )
 
 
@@ -123,6 +124,7 @@ def run_tagfastq(
         barcode_db: str = None,
         chunk_size: int = 100_000,
         bin_map: str = None,
+        sort_within_bin: bool = False,
 ):
     logger.info("Starting")
     # Lazy import Summary to avoid import-time dependency on heavy libs (pysam, etc.).
@@ -222,11 +224,15 @@ def run_tagfastq(
 
         writer = stack.enter_context(Output(file1=output1, file2=output2, interleaved=out_interleaved,
                                             file_nobc1=output_nobc1, file_nobc2=output_nobc2, mapper=mapper,
-                                            bins_dir=output_bins, nr_bins=nr_bins, bin_map=bin_mapping))
+                                            bins_dir=output_bins, nr_bins=nr_bins, bin_map=bin_mapping,
+                                            heap_index_map=heap if 'heap' in locals() else None,
+                                            sort_within_bin=sort_within_bin))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
-            chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir , chunk_size=chunk_size))
+            # For EMA we want to be able to sort by corrected barcode first, then by heap index.
+            key_mode = 'barcode_heap' if mapper == 'ema' else 'heap'
+            chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir, chunk_size=chunk_size, key_mode=key_mode))
 
         for read1, read2, corrected_barcode_seq in parse_reads(
             reader, seq_to_barcode, uncorrected_barcode_reader, barcode_tag, sequence_tag,
@@ -252,8 +258,9 @@ def run_tagfastq(
                     writer.write_to_bin(read1, read2, corrected_barcode_seq)
                     summary["Read pairs written"] += 1
                 else:
+                    # Build chunk lines keyed by corrected barcode then heap index so we can sort/group by barcode
                     chunks.build_chunk(
-                        f"{str(heap[corrected_barcode_seq])}\t"
+                        f"{corrected_barcode_seq}\t{str(heap[corrected_barcode_seq])}\t"
                         f"{read1.name}\t"
                         f"{read1.sequence}\t"
                         f"{read1.qualities}\t"
@@ -311,9 +318,14 @@ def run_tagfastq(
 
 def write_ema_output(chunks, writer, summary):
     for entry in chunks.parse_chunks():
-        r1 = dnaio.Sequence(*entry[1:4])
-        r2 = dnaio.Sequence(entry[1], *entry[4:6])
-        writer.write(r1, r2, heap=entry[0])
+        # entry format: [canonical_barcode, heap_index, name, seq1, qual1, seq2, qual2]
+        if len(entry) < 7:
+            continue
+        barcode = entry[0]
+        heap_idx = int(entry[1])
+        r1 = dnaio.Sequence(entry[2], entry[3], entry[4])
+        r2 = dnaio.Sequence(entry[2], entry[5], entry[6])
+        writer.write(r1, r2, heap=heap_idx)
         summary["Read pairs written"] += 1
 
 
@@ -490,7 +502,7 @@ class Output:
     BIN_FASTQ_TEMPLATE = "ema-bin-*"  # Same name as in `ema preproc`.
 
     def __init__(self, file1=None, file2=None, interleaved=False, file_nobc1=None, file_nobc2=None, mapper=None,
-                 bins_dir=None, nr_bins=None, bin_map=None):
+                 bins_dir=None, nr_bins=None, bin_map=None, heap_index_map=None, sort_within_bin: bool = False):
         self._mapper = mapper
 
         self._bin_nr = 0
@@ -500,6 +512,8 @@ class Output:
         self._nr_bins = nr_bins
         self._barcode_bin_map = {}
         self._barcode_to_bin = bin_map
+        self._heap_index_map = heap_index_map
+        self._sort_within_bin = sort_within_bin
         self._open_bins = None
         self._prev_heap = None
         self._bin_filled = True
@@ -588,10 +602,21 @@ class Output:
         self._bin_files = []
         # Reset _bin_nr so filenames correspond to indices
         self._bin_nr = 0
-        for i in range(self._nr_bins):
-            bin_nr_str = str(i).zfill(3)
-            file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
-            self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
+        # If requested, open temporary chunk files for each bin so we can sort within-bin later.
+        if self._sort_within_bin:
+            self._bin_chunk_paths = []
+            for i in range(self._nr_bins):
+                bin_nr_str = str(i).zfill(3)
+                tmp_name = self._bins_dir / (Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str) + ".chunk")
+                # Open as plain text for writing chunk lines (canonical,heap,name,seq1,qual1,seq2,qual2)
+                fh = open(tmp_name, "w")
+                self._bin_files.append(fh)
+                self._bin_chunk_paths.append(tmp_name)
+        else:
+            for i in range(self._nr_bins):
+                bin_nr_str = str(i).zfill(3)
+                file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
+                self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
 
     def _check_bin_full(self):
         if self._reads_written > self._bin_size:
@@ -621,8 +646,20 @@ class Output:
             # choose bin by hashing canonical
             bin_idx = hash(canonical_barcode) % len(self._bin_files)
 
+        # If sort-within-bin requested, write chunk-style lines including heap index
         fh = self._bin_files[bin_idx]
-        fh.write(read1, read2)
+        if self._sort_within_bin:
+            # Determine heap index if available
+            heap_idx = 0
+            try:
+                if self._heap_index_map is not None:
+                    heap_idx = self._heap_index_map.get(canonical_barcode, 0)
+            except Exception:
+                heap_idx = 0
+            line = f"{canonical_barcode}\t{heap_idx}\t{read1.name}\t{read1.sequence}\t{read1.qualities}\t{read2.sequence}\t{read2.qualities}\n"
+            fh.write(line)
+        else:
+            fh.write(read1, read2)
 
     def write(self, read1, read2=None, heap=None):
         self._pre_write(heap)
@@ -661,12 +698,67 @@ class Output:
         if self._open_file_nobc is not None:
             self._open_file_nobc.close()
 
+        # If we opened a rotating iterator of open bins, close them
         if self._open_bins is not None:
             for file in self._open_bins:
                 if file.closed:
                     break
                 else:
                     file.close()
+
+        # If we created per-bin chunk files to be sorted, close them and convert to final FASTQ
+        if getattr(self, '_sort_within_bin', False):
+            try:
+                import os as _os
+                # For each bin chunk file, read, sort by heap index and write final FASTQ
+                for i, chunk_path in enumerate(getattr(self, '_bin_chunk_paths', [])):
+                    try:
+                        fh = open(chunk_path, 'r')
+                    except FileNotFoundError:
+                        continue
+                    lines = fh.readlines()
+                    fh.close()
+                    if not lines:
+                        # create empty final file
+                        final_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", str(i).zfill(3))
+                        # touch the file
+                        open(final_name, 'w').close()
+                        _os.remove(chunk_path)
+                        continue
+
+                    # Each line: canonical \t heap \t name \t seq1 \t qual1 \t seq2 \t qual2\n
+                    def _parse_line(l):
+                        parts = l.rstrip('\n').split('\t')
+                        try:
+                            h = int(parts[1])
+                        except Exception:
+                            h = 0
+                        return h, parts
+
+                    parsed = [_parse_line(l) for l in lines]
+                    parsed.sort(key=lambda x: x[0])
+
+                    final_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", str(i).zfill(3))
+                    out_writer = dnaio.open(final_name, interleaved=True, mode='w', fileformat='fastq')
+                    for _, parts in parsed:
+                        # parts: [canonical, heap, name, seq1, qual1, seq2, qual2]
+                        if len(parts) < 7:
+                            continue
+                        name = parts[2]
+                        seq1 = parts[3]
+                        qual1 = parts[4]
+                        seq2 = parts[5]
+                        qual2 = parts[6]
+                        r1 = dnaio.Sequence(name, seq1, qual1)
+                        r2 = dnaio.Sequence(name, seq2, qual2)
+                        out_writer.write(r1, r2)
+                    out_writer.close()
+                    try:
+                        _os.remove(chunk_path)
+                    except Exception:
+                        pass
+            except Exception:
+                logger.exception("Failed to finalize per-bin sorting files")
 
 
 class ChunkHandler:
@@ -680,6 +772,8 @@ class ChunkHandler:
         self._chunk_file_template = "chunk_*.tsv"
         self._chunk_files = []
         self._chunk_sep = "\t"
+        # key_mode: 'heap' (default) sorts by heap index only; 'barcode_heap' sorts by (barcode, heap)
+        self._key_mode = 'heap'
         self._tmp_writer = self.create_writer()
 
     def __enter__(self):
@@ -705,7 +799,8 @@ class ChunkHandler:
             self._tmp_writer = self.create_writer()
 
     def write_chunk(self):
-        self._output_chunk.sort(key=self._get_heap)
+        # sort by chosen key mode
+        self._output_chunk.sort(key=self._get_key)
         self._tmp_writer.writelines(self._output_chunk)
         self._output_chunk *= 0  # Clear list faster than list.clear(). See https://stackoverflow.com/a/44349418
 
@@ -717,11 +812,27 @@ class ChunkHandler:
             logger.info("Opening chunks for merge")
             chunks = [chunkstack.enter_context(chunk.open(mode="r")) for chunk in self._chunk_files]
             logger.info("Merging chunks")
-            for entry in merge(*chunks, key=self._get_heap):
+            for entry in merge(*chunks, key=self._get_key):
                 yield entry.strip().split(self._chunk_sep)
 
     def _get_heap(self, x):
         return int(x.split(self._chunk_sep)[0])
+
+    def _get_key(self, x):
+        # Return a key suitable for sorting/merging depending on mode
+        parts = x.split(self._chunk_sep)
+        if self._key_mode == 'heap':
+            try:
+                return int(parts[0])
+            except Exception:
+                return 0
+        elif self._key_mode == 'barcode_heap':
+            # Expect format: barcode \t heap \t ...
+            if len(parts) < 2:
+                return ('', 0)
+            return (parts[0], int(parts[1]) if parts[1].isdigit() else 0)
+        else:
+            return x
 
 
 def add_arguments(parser):
@@ -840,4 +951,9 @@ def add_arguments(parser):
     parser.add_argument(
         "--bin-map", default=None,
         help="Optional TSV file (canonical_seq, bin_index) produced by deterministic_tagfastq to write reads directly into bins."
+    )
+    parser.add_argument(
+        "--sort-within-bin",
+        action="store_true",
+        help="When writing binned output, sort reads within each bin by heap index (EMA) before writing final FASTQ."
     )
