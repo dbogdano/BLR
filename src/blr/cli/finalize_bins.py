@@ -15,6 +15,8 @@ import argparse
 import heapq
 import os
 import tempfile
+import shutil
+import subprocess
 from typing import List, Iterator, Tuple
 
 
@@ -89,9 +91,10 @@ def merge_runs_and_write(runs: List[Path], out_path: Path):
             out.write(f"{header}\n{seq2}\n+\n{qual2}\n")
 
 
-def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None):
+def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None, use_gsort: bool = True, tmpdir: Path = None):
     if not chunk_path.exists():
         raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
+
     # Determine final path: default is chunk file without suffix, else honor out_path
     if out_path is None:
         final_path = chunk_path.with_suffix("")
@@ -102,6 +105,8 @@ def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None)
             final_path = outp / chunk_path.with_suffix("").name
         else:
             final_path = outp
+
+    # If chunk empty, create empty final and remove chunk
     if chunk_path.stat().st_size == 0:
         final_path.open("w").close()
         try:
@@ -109,6 +114,44 @@ def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None)
         except Exception:
             pass
         return str(final_path)
+
+    # If requested and available, use GNU sort to produce a sorted file, then stream to FASTQ
+    if use_gsort and shutil.which("sort"):
+        try:
+            tmp_sorted_fd, tmp_sorted_path = tempfile.mkstemp(prefix="sorted_", suffix=".tmp", dir=str(tmpdir) if tmpdir else None)
+            os.close(tmp_sorted_fd)
+            tmp_sorted = Path(tmp_sorted_path)
+            # sort by numeric second column (heap index) using tab as delimiter
+            subprocess.run(["sort", "-t", "\t", "-k2,2n", str(chunk_path), "-o", str(tmp_sorted)], check=True)
+
+            with tmp_sorted.open("r") as sfh, final_path.open("w") as out:
+                for line in sfh:
+                    parts = line.rstrip("\n").split("\t")
+                    if len(parts) < 7:
+                        continue
+                    name = parts[2]
+                    header = name if name.startswith("@") else "@" + name
+                    seq1 = parts[3]
+                    qual1 = parts[4]
+                    seq2 = parts[5]
+                    qual2 = parts[6]
+                    out.write(f"{header}\n{seq1}\n+\n{qual1}\n")
+                    out.write(f"{header}\n{seq2}\n+\n{qual2}\n")
+
+            try:
+                tmp_sorted.unlink()
+            except Exception:
+                pass
+            try:
+                chunk_path.unlink()
+            except Exception:
+                pass
+            return str(final_path)
+        except Exception:
+            # On any failure, fall back to python implementation
+            pass
+
+    # Fallback Python external-merge implementation
     runs = split_into_sorted_runs(chunk_path, max_lines=max_lines)
     try:
         merge_runs_and_write(runs, final_path)
@@ -130,6 +173,8 @@ def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--max-lines", type=int, default=200000, help="Max lines to keep in memory per run")
     parser.add_argument("-o", "--out", default=None,
                         help="Optional output file or directory for final FASTQ. If a directory is given the final file is written inside it with the same base name as the chunk (default: same dir as chunk).")
+    parser.add_argument("--tmpdir", default=None,
+                        help="Optional temporary directory to use for intermediate sorted files. Useful to place large temporary files on fast scratch. If not provided the system temp dir is used.")
 
 
 def main(args):
@@ -137,4 +182,5 @@ def main(args):
     if not p.exists():
         raise SystemExit(f"chunk_file does not exist: {p}")
     outp = Path(args.out) if getattr(args, 'out', None) else None
-    print(finalize_chunk_file(p, args.max_lines, out_path=outp))
+    tmpd = Path(args.tmpdir) if getattr(args, 'tmpdir', None) else None
+    print(finalize_chunk_file(p, args.max_lines, out_path=outp, tmpdir=tmpd))

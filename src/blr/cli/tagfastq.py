@@ -98,6 +98,7 @@ def main(args):
         chunk_size=getattr(args, 'chunk_size', None),
         bin_map=getattr(args, 'bin_map', None),
         sort_within_bin=getattr(args, 'sort_within_bin', False),
+        no_auto_finalize=getattr(args, 'no_auto_finalize', False),
     )
 
 
@@ -125,6 +126,7 @@ def run_tagfastq(
         chunk_size: int = 100_000,
         bin_map: str = None,
         sort_within_bin: bool = False,
+        no_auto_finalize: bool = False,
 ):
     logger.info("Starting")
     # Lazy import Summary to avoid import-time dependency on heavy libs (pysam, etc.).
@@ -223,10 +225,12 @@ def run_tagfastq(
                         continue
 
         writer = stack.enter_context(Output(file1=output1, file2=output2, interleaved=out_interleaved,
-                                            file_nobc1=output_nobc1, file_nobc2=output_nobc2, mapper=mapper,
-                                            bins_dir=output_bins, nr_bins=nr_bins, bin_map=bin_mapping,
-                                            heap_index_map=heap if 'heap' in locals() else None,
-                                            sort_within_bin=sort_within_bin))
+                    file_nobc1=output_nobc1, file_nobc2=output_nobc2, mapper=mapper,
+                    bins_dir=output_bins, nr_bins=nr_bins, bin_map=bin_mapping,
+                    heap_index_map=heap if 'heap' in locals() else None,
+                    sort_within_bin=sort_within_bin,
+                    sort_max_lines=chunk_size,
+                    no_auto_finalize=no_auto_finalize))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
@@ -502,7 +506,8 @@ class Output:
     BIN_FASTQ_TEMPLATE = "ema-bin-*"  # Same name as in `ema preproc`.
 
     def __init__(self, file1=None, file2=None, interleaved=False, file_nobc1=None, file_nobc2=None, mapper=None,
-                 bins_dir=None, nr_bins=None, bin_map=None, heap_index_map=None, sort_within_bin: bool = False):
+                 bins_dir=None, nr_bins=None, bin_map=None, heap_index_map=None, sort_within_bin: bool = False,
+                 sort_max_lines: int = 200000, no_auto_finalize: bool = False):
         self._mapper = mapper
 
         self._bin_nr = 0
@@ -514,6 +519,8 @@ class Output:
         self._barcode_to_bin = bin_map
         self._heap_index_map = heap_index_map
         self._sort_within_bin = sort_within_bin
+        self._sort_max_lines = sort_max_lines
+        self._no_auto_finalize = no_auto_finalize
         self._open_bins = None
         self._prev_heap = None
         self._bin_filled = True
@@ -706,59 +713,22 @@ class Output:
                 else:
                     file.close()
 
-        # If we created per-bin chunk files to be sorted, close them and convert to final FASTQ
+        # If we created per-bin chunk files to be sorted, finalize them using the external finalizer
         if getattr(self, '_sort_within_bin', False):
-            try:
-                import os as _os
-                # For each bin chunk file, read, sort by heap index and write final FASTQ
-                for i, chunk_path in enumerate(getattr(self, '_bin_chunk_paths', [])):
-                    try:
-                        fh = open(chunk_path, 'r')
-                    except FileNotFoundError:
-                        continue
-                    lines = fh.readlines()
-                    fh.close()
-                    if not lines:
-                        # create empty final file
-                        final_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", str(i).zfill(3))
-                        # touch the file
-                        open(final_name, 'w').close()
-                        _os.remove(chunk_path)
-                        continue
-
-                    # Each line: canonical \t heap \t name \t seq1 \t qual1 \t seq2 \t qual2\n
-                    def _parse_line(l):
-                        parts = l.rstrip('\n').split('\t')
+            # Skip auto-finalize if explicitly requested
+            if not getattr(self, '_no_auto_finalize', False):
+                try:
+                    # Lazy import to avoid import-time dependency
+                    from blr.cli.finalize_bins import finalize_chunk_file
+                except Exception:
+                    logger.exception("Failed to import per-bin finalizer; skipping finalize step")
+                else:
+                    for chunk_path in getattr(self, '_bin_chunk_paths', []) or []:
                         try:
-                            h = int(parts[1])
+                            # Use the external finalizer which implements a memory-bounded external merge
+                            finalize_chunk_file(Path(chunk_path), max_lines=getattr(self, '_sort_max_lines', 200000))
                         except Exception:
-                            h = 0
-                        return h, parts
-
-                    parsed = [_parse_line(l) for l in lines]
-                    parsed.sort(key=lambda x: x[0])
-
-                    final_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", str(i).zfill(3))
-                    out_writer = dnaio.open(final_name, interleaved=True, mode='w', fileformat='fastq')
-                    for _, parts in parsed:
-                        # parts: [canonical, heap, name, seq1, qual1, seq2, qual2]
-                        if len(parts) < 7:
-                            continue
-                        name = parts[2]
-                        seq1 = parts[3]
-                        qual1 = parts[4]
-                        seq2 = parts[5]
-                        qual2 = parts[6]
-                        r1 = dnaio.Sequence(name, seq1, qual1)
-                        r2 = dnaio.Sequence(name, seq2, qual2)
-                        out_writer.write(r1, r2)
-                    out_writer.close()
-                    try:
-                        _os.remove(chunk_path)
-                    except Exception:
-                        pass
-            except Exception:
-                logger.exception("Failed to finalize per-bin sorting files")
+                            logger.exception("Failed to finalize chunk file %s", chunk_path)
 
 
 class ChunkHandler:
@@ -956,4 +926,9 @@ def add_arguments(parser):
         "--sort-within-bin",
         action="store_true",
         help="When writing binned output, sort reads within each bin by heap index (EMA) before writing final FASTQ."
+    )
+    parser.add_argument(
+        "--no-auto-finalize",
+        action="store_true",
+        help="Do not automatically finalize per-bin chunk files at the end of tagging. Leave .chunk files for separate finalization."
     )
