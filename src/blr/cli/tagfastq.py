@@ -762,7 +762,7 @@ class Output:
 
 
 class ChunkHandler:
-    def __init__(self, tmpdir, chunk_size: int = 100_000):
+    def __init__(self, tmpdir, chunk_size: int = 100_000, key_mode: str = 'heap'):
         # Required for ema sorted output
         # Inspired by: https://stackoverflow.com/questions/56948292/python-sort-a-large-list-that-doesnt-fit-in-memory
         self._output_chunk = []
@@ -773,7 +773,7 @@ class ChunkHandler:
         self._chunk_files = []
         self._chunk_sep = "\t"
         # key_mode: 'heap' (default) sorts by heap index only; 'barcode_heap' sorts by (barcode, heap)
-        self._key_mode = 'heap'
+        self._key_mode = key_mode
         self._tmp_writer = self.create_writer()
 
     def __enter__(self):
