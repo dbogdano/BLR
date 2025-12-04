@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-Finalize a single per-bin chunk file into a sorted FASTQ bin.
+Finalize one per-bin chunk file into a sorted FASTQ (CLI wrapper).
 
-This script processes one chunk file (e.g. "ema-bin-000.chunk"), performs an
-external merge-sort using memory-bounded runs, and writes the final FASTQ with
-the same name but without the ".chunk" suffix (e.g. "ema-bin-000").
-
-Intended to be launched as individual jobs (one per bin) from a job array or
-parallel worker pool.
+This module implements the BLR CLI command `blr finalize_bins` which finalizes
+one `.chunk` file produced by `tagfastq --sort-within-bin` into a final
+interleaved FASTQ file by sorting entries by heap index.
 
 Usage:
-  python3 src/blr/scripts/finalize_bin.py /path/to/ema-bin-000.chunk --max-lines 200000
+  blr finalize_bins /path/to/ema-bin-000.chunk --max-lines 200000
 
 """
+from pathlib import Path
 import argparse
 import heapq
 import os
-from pathlib import Path
 import tempfile
 from typing import List, Iterator, Tuple
 
@@ -92,10 +89,19 @@ def merge_runs_and_write(runs: List[Path], out_path: Path):
             out.write(f"{header}\n{seq2}\n+\n{qual2}\n")
 
 
-def finalize_chunk_file(chunk_path: Path, max_lines: int):
-    final_path = chunk_path.with_suffix("")
+def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None):
     if not chunk_path.exists():
         raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
+    # Determine final path: default is chunk file without suffix, else honor out_path
+    if out_path is None:
+        final_path = chunk_path.with_suffix("")
+    else:
+        outp = Path(out_path)
+        if outp.is_dir() or str(outp).endswith(os.sep):
+            # If out is a directory, place final file inside with same base name
+            final_path = outp / chunk_path.with_suffix("").name
+        else:
+            final_path = outp
     if chunk_path.stat().st_size == 0:
         final_path.open("w").close()
         try:
@@ -119,15 +125,16 @@ def finalize_chunk_file(chunk_path: Path, max_lines: int):
     return str(final_path)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Finalize one per-bin chunk file into a sorted FASTQ")
+def add_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("chunk_file", help="Path to the per-bin chunk file to finalize (.chunk)")
     parser.add_argument("--max-lines", type=int, default=200000, help="Max lines to keep in memory per run")
-    args = parser.parse_args()
+    parser.add_argument("-o", "--out", default=None,
+                        help="Optional output file or directory for final FASTQ. If a directory is given the final file is written inside it with the same base name as the chunk (default: same dir as chunk).")
+
+
+def main(args):
     p = Path(args.chunk_file)
     if not p.exists():
-        parser.error(f"chunk_file does not exist: {p}")
-    print(finalize_chunk_file(p, args.max_lines))
-
-if __name__ == '__main__':
-    main()
+        raise SystemExit(f"chunk_file does not exist: {p}")
+    outp = Path(args.out) if getattr(args, 'out', None) else None
+    print(finalize_chunk_file(p, args.max_lines, out_path=outp))
