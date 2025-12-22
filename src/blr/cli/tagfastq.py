@@ -99,6 +99,7 @@ def main(args):
         bin_map=getattr(args, 'bin_map', None),
         sort_within_bin=getattr(args, 'sort_within_bin', False),
         no_auto_finalize=getattr(args, 'no_auto_finalize', False),
+        gzip_output=getattr(args, 'gzip_output', False),
     )
 
 
@@ -127,6 +128,7 @@ def run_tagfastq(
         bin_map: str = None,
         sort_within_bin: bool = False,
         no_auto_finalize: bool = False,
+        gzip_output: bool = False,
 ):
     logger.info("Starting")
     # Lazy import Summary to avoid import-time dependency on heavy libs (pysam, etc.).
@@ -230,7 +232,8 @@ def run_tagfastq(
                     heap_index_map=heap if 'heap' in locals() else None,
                     sort_within_bin=sort_within_bin,
                     sort_max_lines=chunk_size,
-                    no_auto_finalize=no_auto_finalize))
+                    no_auto_finalize=no_auto_finalize,
+                    gzip_output=gzip_output))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
@@ -507,7 +510,7 @@ class Output:
 
     def __init__(self, file1=None, file2=None, interleaved=False, file_nobc1=None, file_nobc2=None, mapper=None,
                  bins_dir=None, nr_bins=None, bin_map=None, heap_index_map=None, sort_within_bin: bool = False,
-                 sort_max_lines: int = 200000, no_auto_finalize: bool = False):
+                 sort_max_lines: int = 200000, no_auto_finalize: bool = False, gzip_output: bool = False):
         self._mapper = mapper
 
         self._bin_nr = 0
@@ -521,6 +524,7 @@ class Output:
         self._sort_within_bin = sort_within_bin
         self._sort_max_lines = sort_max_lines
         self._no_auto_finalize = no_auto_finalize
+        self._gzip_output = gzip_output
         self._open_bins = None
         self._prev_heap = None
         self._bin_filled = True
@@ -573,6 +577,8 @@ class Output:
     def _get_bin_name(self):
         bin_nr_str = str(self._bin_nr).zfill(3)
         file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
+        if self._gzip_output:
+            file_name = Path(str(file_name) + ".gz")
         self._bin_nr += 1
         return file_name
 
@@ -623,6 +629,8 @@ class Output:
             for i in range(self._nr_bins):
                 bin_nr_str = str(i).zfill(3)
                 file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
+                if self._gzip_output:
+                    file_name = Path(str(file_name) + ".gz")
                 self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
 
     def _check_bin_full(self):
@@ -726,7 +734,8 @@ class Output:
                     for chunk_path in getattr(self, '_bin_chunk_paths', []) or []:
                         try:
                             # Use the external finalizer which implements a memory-bounded external merge
-                            finalize_chunk_file(Path(chunk_path), max_lines=getattr(self, '_sort_max_lines', 200000))
+                            finalize_chunk_file(Path(chunk_path), max_lines=getattr(self, '_sort_max_lines', 200000),
+                                              gzip_output=getattr(self, '_gzip_output', False))
                         except Exception:
                             logger.exception("Failed to finalize chunk file %s", chunk_path)
 
@@ -931,4 +940,9 @@ def add_arguments(parser):
         "--no-auto-finalize",
         action="store_true",
         help="Do not automatically finalize per-bin chunk files at the end of tagging. Leave .chunk files for separate finalization."
+    )
+    parser.add_argument(
+        "--gzip-output",
+        action="store_true",
+        help="Automatically gzip per-bin output FASTQ files by appending .gz to filenames."
     )

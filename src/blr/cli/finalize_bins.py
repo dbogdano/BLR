@@ -91,7 +91,7 @@ def merge_runs_and_write(runs: List[Path], out_path: Path):
             out.write(f"{header}\n{seq2}\n+\n{qual2}\n")
 
 
-def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None, use_gsort: bool = True, tmpdir: Path = None):
+def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None, use_gsort: bool = True, tmpdir: Path = None, gzip_output: bool = False):
     if not chunk_path.exists():
         raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
 
@@ -105,6 +105,10 @@ def finalize_chunk_file(chunk_path: Path, max_lines: int, out_path: Path = None,
             final_path = outp / chunk_path.with_suffix("").name
         else:
             final_path = outp
+    
+    # Append .gz if gzip_output is requested
+    if gzip_output and not str(final_path).endswith('.gz'):
+        final_path = Path(str(final_path) + '.gz')
 
     # If chunk empty, create empty final and remove chunk
     if chunk_path.stat().st_size == 0:
@@ -175,6 +179,8 @@ def add_arguments(parser: argparse.ArgumentParser):
                         help="Optional output file or directory for final FASTQ. If a directory is given the final file is written inside it with the same base name as the chunk (default: same dir as chunk).")
     parser.add_argument("--tmpdir", default=None,
                         help="Optional temporary directory to use for intermediate sorted files. Useful to place large temporary files on fast scratch. If not provided the system temp dir is used.")
+    parser.add_argument("--gzip", action="store_true",
+                        help="Gzip the output FASTQ file by appending .gz to the filename.")
 
 
 def main(args):
@@ -183,4 +189,5 @@ def main(args):
         raise SystemExit(f"chunk_file does not exist: {p}")
     outp = Path(args.out) if getattr(args, 'out', None) else None
     tmpd = Path(args.tmpdir) if getattr(args, 'tmpdir', None) else None
-    print(finalize_chunk_file(p, args.max_lines, out_path=outp, tmpdir=tmpd))
+    gzip = getattr(args, 'gzip', False)
+    print(finalize_chunk_file(p, args.max_lines, out_path=outp, tmpdir=tmpd, gzip_output=gzip))
