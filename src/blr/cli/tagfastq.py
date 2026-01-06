@@ -100,6 +100,7 @@ def main(args):
         sort_within_bin=getattr(args, 'sort_within_bin', False),
         no_auto_finalize=getattr(args, 'no_auto_finalize', False),
         gzip_output=getattr(args, 'gzip_output', False),
+        skip_existing_bins=getattr(args, 'skip_existing_bins', False),
     )
 
 
@@ -129,6 +130,7 @@ def run_tagfastq(
         sort_within_bin: bool = False,
         no_auto_finalize: bool = False,
         gzip_output: bool = False,
+        skip_existing_bins: bool = False,
 ):
     logger.info("Starting")
     # Lazy import Summary to avoid import-time dependency on heavy libs (pysam, etc.).
@@ -233,7 +235,8 @@ def run_tagfastq(
                     sort_within_bin=sort_within_bin,
                     sort_max_lines=chunk_size,
                     no_auto_finalize=no_auto_finalize,
-                    gzip_output=gzip_output))
+                    gzip_output=gzip_output,
+                    skip_existing_bins=skip_existing_bins))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
         if mapper in ["ema", "lariat"]:
@@ -510,7 +513,8 @@ class Output:
 
     def __init__(self, file1=None, file2=None, interleaved=False, file_nobc1=None, file_nobc2=None, mapper=None,
                  bins_dir=None, nr_bins=None, bin_map=None, heap_index_map=None, sort_within_bin: bool = False,
-                 sort_max_lines: int = 200000, no_auto_finalize: bool = False, gzip_output: bool = False):
+                 sort_max_lines: int = 200000, no_auto_finalize: bool = False, gzip_output: bool = False,
+                 skip_existing_bins: bool = False):
         self._mapper = mapper
 
         self._bin_nr = 0
@@ -525,6 +529,7 @@ class Output:
         self._sort_max_lines = sort_max_lines
         self._no_auto_finalize = no_auto_finalize
         self._gzip_output = gzip_output
+        self._skip_existing_bins = skip_existing_bins
         self._open_bins = None
         self._prev_heap = None
         self._bin_filled = True
@@ -621,17 +626,28 @@ class Output:
             for i in range(self._nr_bins):
                 bin_nr_str = str(i).zfill(3)
                 tmp_name = self._bins_dir / (Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str) + ".chunk")
-                # Open as plain text for writing chunk lines (canonical,heap,name,seq1,qual1,seq2,qual2)
-                fh = open(tmp_name, "w")
-                self._bin_files.append(fh)
-                self._bin_chunk_paths.append(tmp_name)
+                # Check if we should skip this bin due to existing file
+                if self._skip_existing_bins and tmp_name.exists():
+                    logger.info(f"Skipping bin {i}: chunk file already exists at {tmp_name}")
+                    self._bin_files.append(None)
+                    self._bin_chunk_paths.append(None)
+                else:
+                    # Open as plain text for writing chunk lines (canonical,heap,name,seq1,qual1,seq2,qual2)
+                    fh = open(tmp_name, "w")
+                    self._bin_files.append(fh)
+                    self._bin_chunk_paths.append(tmp_name)
         else:
             for i in range(self._nr_bins):
                 bin_nr_str = str(i).zfill(3)
                 file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
                 if self._gzip_output:
                     file_name = Path(str(file_name) + ".gz")
-                self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
+                # Check if we should skip this bin due to existing file
+                if self._skip_existing_bins and file_name.exists():
+                    logger.info(f"Skipping bin {i}: output file already exists at {file_name}")
+                    self._bin_files.append(None)
+                else:
+                    self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
 
     def _check_bin_full(self):
         if self._reads_written > self._bin_size:
@@ -663,6 +679,9 @@ class Output:
 
         # If sort-within-bin requested, write chunk-style lines including heap index
         fh = self._bin_files[bin_idx]
+        # Skip writing if bin file handle is None (existing file being skipped)
+        if fh is None:
+            return
         if self._sort_within_bin:
             # Determine heap index if available
             heap_idx = 0
@@ -713,6 +732,12 @@ class Output:
         if self._open_file_nobc is not None:
             self._open_file_nobc.close()
 
+        # Close bin files, skipping None entries (existing files that were skipped)
+        if hasattr(self, '_bin_files'):
+            for fh in self._bin_files:
+                if fh is not None and not getattr(fh, 'closed', True):
+                    fh.close()
+
         # If we opened a rotating iterator of open bins, close them
         if self._open_bins is not None:
             for file in self._open_bins:
@@ -732,6 +757,9 @@ class Output:
                     logger.exception("Failed to import per-bin finalizer; skipping finalize step")
                 else:
                     for chunk_path in getattr(self, '_bin_chunk_paths', []) or []:
+                        # Skip None entries (existing files that were skipped)
+                        if chunk_path is None:
+                            continue
                         try:
                             # Use the external finalizer which implements a memory-bounded external merge
                             finalize_chunk_file(Path(chunk_path), max_lines=getattr(self, '_sort_max_lines', 200000),
@@ -945,4 +973,9 @@ def add_arguments(parser):
         "--gzip-output",
         action="store_true",
         help="Automatically gzip per-bin output FASTQ files by appending .gz to filenames."
+    )
+    parser.add_argument(
+        "--skip-existing-bins",
+        action="store_true",
+        help="When using --bin-map, skip creating output for bins whose files already exist. Only create new bin files."
     )
