@@ -620,6 +620,10 @@ class Output:
         self._bin_files = []
         # Reset _bin_nr so filenames correspond to indices
         self._bin_nr = 0
+        # Use in-memory buffers for better write performance in both sorted and non-sorted modes
+        self._bin_buffers = []
+        self._buffer_size = 10000  # Buffer 10k reads per bin before flushing
+        
         # If requested, open temporary chunk files for each bin so we can sort within-bin later.
         if self._sort_within_bin:
             self._bin_chunk_paths = []
@@ -631,12 +635,15 @@ class Output:
                     logger.info(f"Skipping bin {i}: chunk file already exists at {tmp_name}")
                     self._bin_files.append(None)
                     self._bin_chunk_paths.append(None)
+                    self._bin_buffers.append(None)
                 else:
-                    # Open as plain text for writing chunk lines (canonical,heap,name,seq1,qual1,seq2,qual2)
-                    fh = open(tmp_name, "w")
+                    # Open with larger buffer size (1MB) for better I/O performance
+                    fh = open(tmp_name, "w", buffering=1024*1024)
                     self._bin_files.append(fh)
                     self._bin_chunk_paths.append(tmp_name)
+                    self._bin_buffers.append([])
         else:
+            # For non-sorted mode, also use buffers but store read pairs
             for i in range(self._nr_bins):
                 bin_nr_str = str(i).zfill(3)
                 file_name = self._bins_dir / Output.BIN_FASTQ_TEMPLATE.replace("*", bin_nr_str)
@@ -646,8 +653,10 @@ class Output:
                 if self._skip_existing_bins and file_name.exists():
                     logger.info(f"Skipping bin {i}: output file already exists at {file_name}")
                     self._bin_files.append(None)
+                    self._bin_buffers.append(None)
                 else:
                     self._bin_files.append(dnaio.open(file_name, interleaved=True, mode="w", fileformat="fastq"))
+                    self._bin_buffers.append([])  # Buffer to store (read1, read2) tuples
 
     def _check_bin_full(self):
         if self._reads_written > self._bin_size:
@@ -677,12 +686,16 @@ class Output:
             # choose bin by hashing canonical
             bin_idx = hash(canonical_barcode) % len(self._bin_files)
 
-        # If sort-within-bin requested, write chunk-style lines including heap index
+        # Get file handle and buffer for this bin
         fh = self._bin_files[bin_idx]
+        buffer = self._bin_buffers[bin_idx]
+        
         # Skip writing if bin file handle is None (existing file being skipped)
         if fh is None:
             return
+            
         if self._sort_within_bin:
+            # For sorted output, buffer as text lines
             # Determine heap index if available
             heap_idx = 0
             try:
@@ -690,10 +703,22 @@ class Output:
                     heap_idx = self._heap_index_map.get(canonical_barcode, 0)
             except Exception:
                 heap_idx = 0
-            line = f"{canonical_barcode}\t{heap_idx}\t{read1.name}\t{read1.sequence}\t{read1.qualities}\t{read2.sequence}\t{read2.qualities}\n"
-            fh.write(line)
+            # Build line using join (faster than f-string for this pattern)
+            line = "\t".join([canonical_barcode, str(heap_idx), read1.name, 
+                             read1.sequence, read1.qualities, read2.sequence, read2.qualities]) + "\n"
+            buffer.append(line)
+            # Flush buffer when it reaches threshold
+            if len(buffer) >= self._buffer_size:
+                fh.writelines(buffer)
+                buffer.clear()
         else:
-            fh.write(read1, read2)
+            # For non-sorted output, buffer read pairs and batch write to dnaio
+            buffer.append((read1, read2))
+            # Flush buffer when it reaches threshold
+            if len(buffer) >= self._buffer_size:
+                for r1, r2 in buffer:
+                    fh.write(r1, r2)
+                buffer.clear()
 
     def write(self, read1, read2=None, heap=None):
         self._pre_write(heap)
@@ -731,6 +756,22 @@ class Output:
             self._open_file.close()
         if self._open_file_nobc is not None:
             self._open_file_nobc.close()
+
+        # Flush any remaining buffered data before closing
+        if hasattr(self, '_bin_buffers') and self._bin_buffers:
+            for i, (fh, buffer) in enumerate(zip(self._bin_files, self._bin_buffers)):
+                if fh is not None and buffer is not None and buffer:
+                    try:
+                        if self._sort_within_bin:
+                            # Flush text line buffers
+                            fh.writelines(buffer)
+                        else:
+                            # Flush read pair buffers
+                            for r1, r2 in buffer:
+                                fh.write(r1, r2)
+                        buffer.clear()
+                    except Exception:
+                        logger.warning(f"Failed to flush buffer for bin {i}")
 
         # Close bin files, skipping None entries (existing files that were skipped)
         if hasattr(self, '_bin_files'):
