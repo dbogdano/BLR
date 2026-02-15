@@ -161,17 +161,10 @@ def run_tagfastq(
     # canonical sequence. If a barcode DB is provided we avoid building the full
     # raw->canonical dict (which can be very large) and only build the heap index
     # needed for ema/lariat sorting when required.
-    # When using --bin-map, we also skip building the full dict since we only need bin assignment.
     logger.info("Map clusters")
     template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
     
-    # Skip loading full barcode mapping if using --bin-map (we only need bin_mapping dict)
-    if bin_map:
-        # With --bin-map, we don't need the seq_to_barcode mapping or heap for sorting
-        seq_to_barcode = None
-        heap = {}
-        logger.info("Using deterministic bin mapping - skipping full barcode dictionary load")
-    elif barcode_db:
+    if barcode_db:
         # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
         if mapper in ["ema", "lariat"]:
             # Build only the heap index for sorting
@@ -181,7 +174,13 @@ def run_tagfastq(
             seq_to_barcode = None
             heap = {}
     else:
+        # Always load barcode dict for lookup (needed even with --bin-map for raw->canonical mapping)
         seq_to_barcode, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count)
+        
+        # With --bin-map, we don't need the heap for sorting (only for bin assignment)
+        if bin_map:
+            logger.info("Using deterministic bin mapping - skipping sort heap index")
+            heap = {}
 
     in_interleaved = not input2
     logger.info(f"Input detected as {'interleaved' if in_interleaved else 'paired'} FASTQ.")
