@@ -161,9 +161,17 @@ def run_tagfastq(
     # canonical sequence. If a barcode DB is provided we avoid building the full
     # raw->canonical dict (which can be very large) and only build the heap index
     # needed for ema/lariat sorting when required.
+    # When using --bin-map, we also skip building the full dict since we only need bin assignment.
     logger.info("Map clusters")
     template = [set(IUPAC[base]) for base in pattern_match] if pattern_match else []
-    if barcode_db:
+    
+    # Skip loading full barcode mapping if using --bin-map (we only need bin_mapping dict)
+    if bin_map:
+        # With --bin-map, we don't need the seq_to_barcode mapping or heap for sorting
+        seq_to_barcode = None
+        heap = {}
+        logger.info("Using deterministic bin mapping - skipping full barcode dictionary load")
+    elif barcode_db:
         # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
         if mapper in ["ema", "lariat"]:
             # Build only the heap index for sorting
@@ -239,15 +247,22 @@ def run_tagfastq(
                     skip_existing_bins=skip_existing_bins))
         uncorrected_barcode_reader = stack.enter_context(BarcodeReader(uncorrected_barcodes))
         chunks = None
-        if mapper in ["ema", "lariat"]:
+        # Only create ChunkHandler if NOT using --bin-map (chunking not needed for direct bin writes)
+        if mapper in ["ema", "lariat"] and bin_map is None:
             # For EMA we want to be able to sort by corrected barcode first, then by heap index.
             key_mode = 'barcode_heap' if mapper == 'ema' else 'heap'
             chunks = stack.enter_context(ChunkHandler(tmpdir=tmpdir, chunk_size=chunk_size, key_mode=key_mode))
+            logger.info("Created ChunkHandler for sorted output")
 
         for read1, read2, corrected_barcode_seq in parse_reads(
             reader, seq_to_barcode, uncorrected_barcode_reader, barcode_tag, sequence_tag,
             mapper, db_type=db_type, db_cur=db_cur, db_txn=db_txn):
             summary["Read pairs read"] += 1
+            
+            # Log progress every 100k reads
+            if summary["Read pairs read"] % 100000 == 0:
+                logger.info(f"Processed {summary['Read pairs read']:,} read pairs, {summary['Read pairs written']:,} written")
+            
             if corrected_barcode_seq is None:
                 summary["Reads missing barcode"] += 1
 
@@ -305,8 +320,10 @@ def run_tagfastq(
             writer.set_bin_size(bin_size)
 
         if mapper == "ema":
+            logger.info("Writing EMA output from chunks")
             write_ema_output(chunks, writer, summary)
         elif mapper == "lariat":
+            logger.info("Writing lariat output from chunks")
             write_lariat_output(chunks, writer, summary)
 
         # Close any DB resources opened for lookup
