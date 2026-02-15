@@ -378,7 +378,9 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         name_and_pos, nr_and_index1 = read1.name.split(maxsplit=1)
 
         uncorrected_barcode_seq = uncorrected_barcode_reader.get_barcode(name_and_pos)
-        if db_type == 'lmdb' and db_txn is not None:
+        if uncorrected_barcode_seq is None:
+            corrected_barcode_seq = None
+        elif db_type == 'lmdb' and db_txn is not None:
             corrected_barcode_seq = lookup_lmdb(db_txn, uncorrected_barcode_seq)
         elif db_type == 'sqlite' and db_cur is not None:
             corrected_barcode_seq = lookup_canonical(db_cur, uncorrected_barcode_seq)
