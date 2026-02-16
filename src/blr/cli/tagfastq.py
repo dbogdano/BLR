@@ -500,18 +500,37 @@ class BarcodeReader:
         self._file = dnaio.open(filename, mode="r")
         self.barcodes = iter(self._file)
 
+    @staticmethod
+    def _normalize_read_name(name: str) -> str:
+        name = name.partition(" ")[0]
+        if name.endswith("/1") or name.endswith("/2"):
+            return name[:-2]
+        # Drop known library suffixes that differ between read and barcode FASTQs
+        if name.endswith(":5prime") or name.endswith(":internal") or name.endswith(":3prime"):
+            return name.rsplit(":", 1)[0]
+        return name
+
     def get_barcode(self, read_name, maxiter=128):
+        read_name = read_name.partition(" ")[0]
+        read_base = self._normalize_read_name(read_name)
+
         if read_name in self._cache:
             return self._cache.pop(read_name)
+        if read_base in self._cache:
+            return self._cache.pop(read_base)
 
         for barcode in islice(self.barcodes, maxiter):
             barcode_id = barcode.name.partition(" ")[0]
+            barcode_base = self._normalize_read_name(barcode_id)
             # If read_name in next pair then parser lines are synced --> drop cache.
-            if read_name == barcode_id:
+            if (read_name == barcode_id or read_name == barcode_base or
+                    read_base == barcode_id or read_base == barcode_base):
                 self._cache.clear()
                 return barcode.sequence
 
             self._cache[barcode_id] = barcode.sequence
+            if barcode_base != barcode_id:
+                self._cache[barcode_base] = barcode.sequence
 
     def __enter__(self):
         return self
