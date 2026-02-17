@@ -167,7 +167,8 @@ def run_tagfastq(
     
     if barcode_db:
         # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
-        if mapper in ["ema", "lariat"]:
+        # If --bin-map is provided, we write directly to bins and do not need a heap index.
+        if mapper in ["ema", "lariat"] and not bin_map:
             # Build only the heap index for sorting
             seq_to_barcode = None
             _, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count, only_heap=True)
