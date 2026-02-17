@@ -166,8 +166,7 @@ def run_tagfastq(
     
     if barcode_db:
         # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
-        # If --bin-map is provided, we write directly to bins and do not need a heap index.
-        if mapper in ["ema", "lariat"] and not bin_map:
+        if mapper in ["ema", "lariat"]:
             # Build only the heap index for sorting
             seq_to_barcode = None
             _, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count, only_heap=True)
@@ -379,9 +378,7 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         name_and_pos, nr_and_index1 = read1.name.split(maxsplit=1)
 
         uncorrected_barcode_seq = uncorrected_barcode_reader.get_barcode(name_and_pos)
-        if uncorrected_barcode_seq is None:
-            corrected_barcode_seq = None
-        elif db_type == 'lmdb' and db_txn is not None:
+        if db_type == 'lmdb' and db_txn is not None:
             corrected_barcode_seq = lookup_lmdb(db_txn, uncorrected_barcode_seq)
         elif db_type == 'sqlite' and db_cur is not None:
             corrected_barcode_seq = lookup_canonical(db_cur, uncorrected_barcode_seq)
@@ -501,37 +498,18 @@ class BarcodeReader:
         self._file = dnaio.open(filename, mode="r")
         self.barcodes = iter(self._file)
 
-    @staticmethod
-    def _normalize_read_name(name: str) -> str:
-        name = name.partition(" ")[0]
-        if name.endswith("/1") or name.endswith("/2"):
-            return name[:-2]
-        # Drop known library suffixes that differ between read and barcode FASTQs
-        if name.endswith(":5prime") or name.endswith(":internal") or name.endswith(":3prime"):
-            return name.rsplit(":", 1)[0]
-        return name
-
     def get_barcode(self, read_name, maxiter=128):
-        read_name = read_name.partition(" ")[0]
-        read_base = self._normalize_read_name(read_name)
-
         if read_name in self._cache:
             return self._cache.pop(read_name)
-        if read_base in self._cache:
-            return self._cache.pop(read_base)
 
         for barcode in islice(self.barcodes, maxiter):
             barcode_id = barcode.name.partition(" ")[0]
-            barcode_base = self._normalize_read_name(barcode_id)
             # If read_name in next pair then parser lines are synced --> drop cache.
-            if (read_name == barcode_id or read_name == barcode_base or
-                    read_base == barcode_id or read_base == barcode_base):
+            if read_name == barcode_id:
                 self._cache.clear()
                 return barcode.sequence
 
             self._cache[barcode_id] = barcode.sequence
-            if barcode_base != barcode_id:
-                self._cache[barcode_base] = barcode.sequence
 
     def __enter__(self):
         return self
