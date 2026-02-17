@@ -374,12 +374,8 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         def tqdm(x, **_):
             return x
 
-    # Create a cached lookup wrapper for LMDB to avoid repeated database queries
-    # for the same barcode sequences. Use maxsize=100000 for ~10MB cache assuming
-    # 20-char barcodes + overhead.
-    @lru_cache(maxsize=100000)
-    def cached_lookup_lmdb(raw_seq: str):
-        return lookup_lmdb(db_txn, raw_seq)
+    # Build a simple dict cache for LMDB lookups to avoid repeated queries
+    lmdb_cache = {}
 
     for read1, read2 in tqdm(reader, desc="Read pairs processed"):
         # Header parsing
@@ -390,7 +386,12 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         if uncorrected_barcode_seq is None:
             corrected_barcode_seq = None
         elif db_type == 'lmdb' and db_txn is not None:
-            corrected_barcode_seq = cached_lookup_lmdb(uncorrected_barcode_seq)
+            # Check cache first, then query LMDB
+            if uncorrected_barcode_seq in lmdb_cache:
+                corrected_barcode_seq = lmdb_cache[uncorrected_barcode_seq]
+            else:
+                corrected_barcode_seq = lookup_lmdb(db_txn, uncorrected_barcode_seq)
+                lmdb_cache[uncorrected_barcode_seq] = corrected_barcode_seq
         elif db_type == 'sqlite' and db_cur is not None:
             corrected_barcode_seq = lookup_canonical(db_cur, uncorrected_barcode_seq)
         else:
