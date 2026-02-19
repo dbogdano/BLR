@@ -166,8 +166,8 @@ def run_tagfastq(
     
     if barcode_db:
         # When using a disk-backed barcode DB, avoid loading raw->canonical map into RAM.
-        if mapper in ["ema", "lariat"]:
-            # Build only the heap index for sorting
+        if mapper in ["ema", "lariat"] and bin_map is None:
+            # Build only the heap index for sorting (only if not using deterministic bin mapping)
             seq_to_barcode = None
             _, heap = map_corrected_barcodes(corrected_barcodes, summary, mapper, template, min_count, only_heap=True)
         else:
@@ -371,7 +371,7 @@ def parse_reads(reader, corrected_barcodes, uncorrected_barcode_reader, barcode_
         # fallback to identity iterator
         def tqdm(x, **_):
             return x
-
+#SBATCH --partition=fast-io   # or whatever your cluster calls it
     for read1, read2 in tqdm(reader, desc="Read pairs processed"):
         # Header parsing
         # TODO Handle reads with single header
