@@ -318,12 +318,14 @@ def run_tagfastq(
             logger.info(f"Using bin of size {bin_size}.")
             writer.set_bin_size(bin_size)
 
-        if mapper == "ema":
-            logger.info("Writing EMA output from chunks")
-            write_ema_output(chunks, writer, summary)
-        elif mapper == "lariat":
-            logger.info("Writing lariat output from chunks")
-            write_lariat_output(chunks, writer, summary)
+        # Only process chunks if we created a ChunkHandler (i.e., not using --bin-map)
+        if chunks is not None:
+            if mapper == "ema":
+                logger.info("Writing EMA output from chunks")
+                write_ema_output(chunks, writer, summary)
+            elif mapper == "lariat":
+                logger.info("Writing lariat output from chunks")
+                write_lariat_output(chunks, writer, summary)
 
         # Close any DB resources opened for lookup
         try:
