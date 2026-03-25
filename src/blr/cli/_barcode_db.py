@@ -203,5 +203,7 @@ def lookup_canonical(cur, raw_seq: str):
 
 
 def lookup_lmdb(txn, raw_seq: str):
+    if raw_seq is None:
+        return None
     val = txn.get(raw_seq.encode("ascii"))
     return val.decode("ascii") if val is not None else None
